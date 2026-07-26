@@ -8,6 +8,8 @@ import {
   createSession,
   requireSession,
   revokeSession,
+  rotateSession,
+  revokeAllSessionsForAddress,
 } from "../auth/session.js";
 import { requireAuth } from "../auth/middleware.js";
 
@@ -20,6 +22,11 @@ const VerifyBody = z.object({
 const SessionBody = z.object({
   address: z.string().min(3),
   session_token: z.string().min(10),
+});
+
+const RefreshBody = z.object({
+  address: z.string().min(3),
+  refresh_token: z.string().min(10),
 });
 
 export const authRouter = Router();
@@ -114,6 +121,52 @@ authRouter.post("/auth/logout", requireAuth, async (req, res, next) => {
     if (token) {
       await revokeSession(token);
     }
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+
+// Step 3.5: rotate a refresh token on every use. Detects reuse of an
+// already-rotated (stale) token and revokes the whole token family — a
+// possible token-theft signal, not just a normal auth failure.
+authRouter.post("/auth/refresh", async (req, res, next) => {
+  try {
+    const { address, refresh_token } = RefreshBody.parse(req.body);
+    const result = await rotateSession(address, refresh_token);
+
+    if (!result.ok) {
+      if (result.reason === "reused") {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[auth] Reuse of rotated refresh token detected (family ${result.familyId}); family revoked`,
+        );
+      }
+      res.status(401).json({ ok: false, error: "Invalid refresh token" });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      address,
+      refresh_token: result.token,
+      expires_in_ms: result.expires_in_ms,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Step 5: revoke ALL outstanding tokens for the authenticated user.
+authRouter.post("/auth/revoke", requireAuth, async (req, res, next) => {
+  try {
+    const address = req.auth?.address;
+    if (!address) {
+      res.status(401).json({ ok: false, error: "Unauthorized" });
+      return;
+    }
+    await revokeAllSessionsForAddress(address);
     res.json({ ok: true });
   } catch (e) {
     next(e);

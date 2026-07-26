@@ -12,7 +12,7 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock, mo
     verifyMessageInStarknet: vi.fn(),
   };
 
-  const schema = {
+ const schema = {
     sessions: {
       tokenHash: "tokenHash",
       address: "address",
@@ -21,6 +21,8 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock, mo
       absoluteExpiresAt: "absoluteExpiresAt",
       revokedAt: "revokedAt",
       lastSeen: "lastSeen",
+      familyId: "familyId",
+      rotatedAt: "rotatedAt",
     },
   };
 
@@ -32,12 +34,14 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock, mo
     row[col] !== null && row[col] !== undefined;
 
   const db = {
-    insert: (table: any) => ({
+   insert: (table: any) => ({
       values: async (data: any) => {
         mockState.sessions.push({
           ...data,
           revokedAt: data.revokedAt || null,
           lastSeen: data.lastSeen || null,
+          familyId: data.familyId || null,
+          rotatedAt: data.rotatedAt || null,
         });
       },
     }),
@@ -300,5 +304,92 @@ describe("Auth Routes Integration", () => {
 
     expect(logoutRes.status).toBe(401);
     expect(logoutRes.body.error).toBe("Unauthorized");
+  });
+
+  it("rotates the refresh token on each call and invalidates the previous one", async () => {
+    const address = "0xRotationHappyPath";
+    const appInstance = makeApp();
+
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    const verifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    const firstToken = verifyRes.body.session_token;
+
+    const refreshRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: firstToken });
+
+    expect(refreshRes.status).toBe(200);
+    expect(refreshRes.body.ok).toBe(true);
+    const secondToken = refreshRes.body.refresh_token;
+    expect(secondToken).toBeDefined();
+    expect(secondToken).not.toBe(firstToken);
+
+    // The old token no longer refreshes.
+    const reuseOldRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: firstToken });
+    expect(reuseOldRes.status).toBe(401);
+
+    // The new token works.
+    const refreshAgainRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: secondToken });
+    expect(refreshAgainRes.status).toBe(200);
+  });
+
+  it("rejects reuse of a stale rotated refresh token and revokes the whole family", async () => {
+    const address = "0xStaleReuseAttempt";
+    const appInstance = makeApp();
+
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    const verifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    const firstToken = verifyRes.body.session_token;
+
+    const refreshRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: firstToken });
+    const secondToken = refreshRes.body.refresh_token;
+
+    // Replay the stale, already-rotated first token (simulated theft).
+    const reuseRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: firstToken });
+    expect(reuseRes.status).toBe(401);
+
+    // The whole family — including the legitimate current token — is now dead.
+    const legitimateRefreshRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: secondToken });
+    expect(legitimateRefreshRes.status).toBe(401);
+  });
+
+  it("revoke endpoint immediately invalidates outstanding tokens for that user", async () => {
+    const address = "0xRevokeEverything";
+    const appInstance = makeApp();
+
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    const verifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    const token = verifyRes.body.session_token;
+
+    const revokeRes = await request(appInstance)
+      .post("/api/v1/auth/revoke")
+      .set("x-user-address", address)
+      .set("Authorization", `Bearer ${token}`);
+    expect(revokeRes.status).toBe(200);
+    expect(revokeRes.body.ok).toBe(true);
+
+    const refreshAfterRevokeRes = await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address, refresh_token: token });
+    expect(refreshAfterRevokeRes.status).toBe(401);
   });
 });
