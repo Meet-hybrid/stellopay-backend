@@ -306,7 +306,13 @@ describe("Auth Routes Integration", () => {
     expect(logoutRes.body.error).toBe("Unauthorized");
   });
 
-  it("rotates the refresh token on each call and invalidates the previous one", async () => {
+  it("rotates the refresh token on each call and the latest token keeps working", async () => {
+    // Happy-path rotation chain. Per the documented compromise-signal contract
+    // (docs/auth/session.md), replaying ANY already-rotated token in this family
+    // revokes the whole family — including the legitimate, just-issued refresh
+    // token. That case is exercised separately in the test below. Here we
+    // exercise the no-replay happy path: each rotation uses only the latest
+    // token, and the chain grows by one token per call.
     const address = "0xRotationHappyPath";
     const appInstance = makeApp();
 
@@ -317,27 +323,26 @@ describe("Auth Routes Integration", () => {
       .send({ address, signature: ["0xsig1", "0xsig2"] });
     const firstToken = verifyRes.body.session_token;
 
-    const refreshRes = await request(appInstance)
+    // Rotation 1: firstToken -> secondToken.
+    const refreshRes1 = await request(appInstance)
       .post("/api/v1/auth/refresh")
       .send({ address, refresh_token: firstToken });
-
-    expect(refreshRes.status).toBe(200);
-    expect(refreshRes.body.ok).toBe(true);
-    const secondToken = refreshRes.body.refresh_token;
+    expect(refreshRes1.status).toBe(200);
+    expect(refreshRes1.body.ok).toBe(true);
+    const secondToken = refreshRes1.body.refresh_token;
     expect(secondToken).toBeDefined();
     expect(secondToken).not.toBe(firstToken);
 
-    // The old token no longer refreshes.
-    const reuseOldRes = await request(appInstance)
-      .post("/api/v1/auth/refresh")
-      .send({ address, refresh_token: firstToken });
-    expect(reuseOldRes.status).toBe(401);
-
-    // The new token works.
-    const refreshAgainRes = await request(appInstance)
+    // Rotation 2: secondToken -> thirdToken (always-present the latest token).
+    const refreshRes2 = await request(appInstance)
       .post("/api/v1/auth/refresh")
       .send({ address, refresh_token: secondToken });
-    expect(refreshAgainRes.status).toBe(200);
+    expect(refreshRes2.status).toBe(200);
+    expect(refreshRes2.body.ok).toBe(true);
+    const thirdToken = refreshRes2.body.refresh_token;
+    expect(thirdToken).toBeDefined();
+    expect(thirdToken).not.toBe(firstToken);
+    expect(thirdToken).not.toBe(secondToken);
   });
 
   it("rejects reuse of a stale rotated refresh token and revokes the whole family", async () => {
