@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { z } from "zod";
 import path from "node:path";
+import { parseStarknetRpcUrls } from "./starknet/rpc-urls.js";
 
 dotenv.config();
 
@@ -13,7 +14,7 @@ const EnvSchema = z.object({
   LOG_LEVEL: z.string().optional().default("info"),
   LOG_FORMAT: z.string().optional().default("json"),
 
-  // Required: Starknet RPC URL (v0_8)
+  // Required: Starknet RPC URL(s), v0_8 — comma-separated for failover (HTTPS only)
   // Provide via environment variable (e.g. in `.env` or inline `STARKNET_RPC_URL=... pnpm dev`)
   STARKNET_RPC_URL: z.string().min(1),
   // Users sign transactions client-side; backend does not require account keys.
@@ -114,6 +115,9 @@ const EnvSchema = z.object({
 });
 
 export const env = EnvSchema.parse(process.env);
+
+/** Ordered Starknet JSON-RPC endpoints (primary first) from STARKNET_RPC_URL. */
+export const starknetRpcUrls = parseStarknetRpcUrls(env.STARKNET_RPC_URL);
 
 // Resolve ABI paths - use provided paths or fallback to local contracts directory
 // In production, these should be set as absolute paths or paths relative to the deployed location
