@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth } from "../auth/middleware.js";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
@@ -515,33 +515,45 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
  *
  * Process a single Starknet transaction: fetch its receipt, decode all events
  * using the on-chain ABIs, and persist them to the database.
+ *
+ * **Authentication:** Requires an active admin session (`requireAuth` +
+ * `requireAdmin`). Ingestion writes `agreements`/`agreementEvents`/`payments`/
+ * `escrowEvents` rows for whatever tx hash the caller supplies and can
+ * overwrite a stored agreement's `token` from the on-chain value — matching
+ * the admin-only gate already used by the sibling ingestion routes in
+ * `backfill-events.ts` and `reprocess-events.ts`.
  */
-eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
-  try {
-    const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
+eventsRouter.post(
+  "/events/process_tx/:tx_hash",
+  requireAuth,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
 
-    const result = await processTxReceipt(tx_hash);
+      const result = await processTxReceipt(tx_hash);
 
-    if (result.status === "not_found") {
-      res.status(404).json({ error: "Transaction not found" });
-      return;
+      if (result.status === "not_found") {
+        res.status(404).json({ error: "Transaction not found" });
+        return;
+      }
+
+      if (result.status === "no_events") {
+        res.json({ message: "No events found in transaction", eventsProcessed: 0 });
+        return;
+      }
+
+      res.json({
+        message: `Processed ${result.eventsProcessed} events`,
+        eventsProcessed: result.eventLabels,
+        transactionHash: result.txHash,
+        tokenVerified: result.tokenVerified,
+      });
+    } catch (e) {
+      next(e);
     }
-
-    if (result.status === "no_events") {
-      res.json({ message: "No events found in transaction", eventsProcessed: 0 });
-      return;
-    }
-
-    res.json({
-      message: `Processed ${result.eventsProcessed} events`,
-      eventsProcessed: result.eventLabels,
-      transactionHash: result.txHash,
-      tokenVerified: result.tokenVerified,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
+  },
+);
 
 /**
  * POST /events/process_batch
@@ -560,53 +572,62 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
  * Returns a `results` array where each entry corresponds to one tx hash and
  * contains `{ txHash, status, eventsProcessed, eventLabels?, error? }`.
  * A per-tx error never aborts the rest of the batch.
+ *
+ * **Authentication:** Requires an active admin session (`requireAuth` +
+ * `requireAdmin`) — see the note on `process_tx/:tx_hash` above; the same
+ * privileged ingestion capability applies per tx hash in the batch.
  */
-eventsRouter.post("/events/process_batch", requireAuth, async (req, res, next) => {
-  try {
-    const { tx_hashes } = z
-      .object({
-        tx_hashes: z
-          .array(TxHashSchema)
-          .min(1, "tx_hashes must contain at least one hash")
-          .max(
-            MAX_BATCH_SIZE,
-            `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-          ),
-      })
-      .parse(req.body);
+eventsRouter.post(
+  "/events/process_batch",
+  requireAuth,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const { tx_hashes } = z
+        .object({
+          tx_hashes: z
+            .array(TxHashSchema)
+            .min(1, "tx_hashes must contain at least one hash")
+            .max(
+              MAX_BATCH_SIZE,
+              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+            ),
+        })
+        .parse(req.body);
 
-    const results: TxProcessResult[] = [];
+      const results: TxProcessResult[] = [];
 
-    for (const txHash of tx_hashes) {
-      try {
-        const result = await processTxReceipt(txHash);
-        results.push(result);
-      } catch (e: any) {
-        // Per-tx errors are captured so they don't abort the rest of the batch
-        results.push({
-          txHash,
-          status: "error",
-          eventsProcessed: 0,
-          eventLabels: [],
-          error: e?.message ?? String(e),
-        });
+      for (const txHash of tx_hashes) {
+        try {
+          const result = await processTxReceipt(txHash);
+          results.push(result);
+        } catch (e: any) {
+          // Per-tx errors are captured so they don't abort the rest of the batch
+          results.push({
+            txHash,
+            status: "error",
+            eventsProcessed: 0,
+            eventLabels: [],
+            error: e?.message ?? String(e),
+          });
+        }
       }
+
+      const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+      res.json({
+        summary: {
+          total: results.length,
+          processed: results.filter((r) => r.status === "processed").length,
+          noEvents: results.filter((r) => r.status === "no_events").length,
+          notFound: results.filter((r) => r.status === "not_found").length,
+          errors: results.filter((r) => r.status === "error").length,
+          totalEventsProcessed: totalProcessed,
+        },
+        results,
+      });
+    } catch (e) {
+      next(e);
     }
-
-    const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
-
-    res.json({
-      summary: {
-        total: results.length,
-        processed: results.filter((r) => r.status === "processed").length,
-        noEvents: results.filter((r) => r.status === "no_events").length,
-        notFound: results.filter((r) => r.status === "not_found").length,
-        errors: results.filter((r) => r.status === "error").length,
-        totalEventsProcessed: totalProcessed,
-      },
-      results,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
+  },
+);

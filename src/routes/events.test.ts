@@ -194,9 +194,19 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+// Named via vi.hoisted so individual tests can override behavior (e.g.
+// simulate requireAdmin rejecting a non-admin caller) with mockImplementationOnce.
+// vi.clearAllMocks() (used throughout this file) clears call history but not
+// the base implementation set here, so the default "always call next()"
+// behavior persists across tests unless explicitly overridden.
+const { mockRequireAuth, mockRequireAdmin } = vi.hoisted(() => ({
+  mockRequireAuth: vi.fn((_req: any, _res: any, next: any) => next()),
+  mockRequireAdmin: vi.fn((_req: any, _res: any, next: any) => next()),
+}));
+
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: mockRequireAuth,
+  requireAdmin: mockRequireAdmin,
 }));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
@@ -537,5 +547,69 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Authentication & Authorization
+  //
+  // process_tx/process_batch ingest arbitrary on-chain tx hashes, decode their
+  // events, write agreements/agreementEvents/payments/escrowEvents rows, and
+  // can overwrite a stored agreement's token from the on-chain value. That
+  // capability now requires an admin session (requireAuth + requireAdmin),
+  // matching the gate already used by the sibling ingestion routes in
+  // backfill-events.ts and reprocess-events.ts.
+  // -------------------------------------------------------------------------
+
+  describe("Authentication & Authorization", () => {
+    it("failure path: rejects an unauthenticated caller before process_tx runs (requireAuth fails)", async () => {
+      mockRequireAuth.mockImplementationOnce((_req: any, res: any) => {
+        res.status(401).json({ error: "Unauthorized" });
+      });
+
+      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: "Unauthorized" });
+      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    });
+
+    it("failure path: rejects a non-admin caller before process_tx runs (requireAdmin fails)", async () => {
+      mockRequireAdmin.mockImplementationOnce((_req: any, res: any) => {
+        res.status(401).json({ error: "Unauthorized" });
+      });
+
+      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: "Unauthorized" });
+      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    });
+
+    it("failure path: rejects a non-admin caller before process_batch runs (requireAdmin fails)", async () => {
+      mockRequireAdmin.mockImplementationOnce((_req: any, res: any) => {
+        res.status(401).json({ error: "Unauthorized" });
+      });
+
+      const res = await request(makeApp())
+        .post("/events/process_batch")
+        .send({ tx_hashes: [TX_A] });
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: "Unauthorized" });
+      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    });
+
+    it("success path: an authenticated admin caller reaches process_tx and gets a 200", async () => {
+      parseEventMock.mockReturnValue(decodedAgreementCreated());
+      vi.mocked(provider.getTransactionReceipt).mockResolvedValue(
+        makeAgreementReceipt(TX_A) as any,
+      );
+
+      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+
+      expect(mockRequireAuth).toHaveBeenCalled();
+      expect(mockRequireAdmin).toHaveBeenCalled();
+      expect(res.status).toBe(200);
+    });
   });
 });
