@@ -257,15 +257,22 @@ export const billingInvoices = pgTable(
 export const sessions = pgTable(
   "sessions",
   {
-    tokenHash: text("token_hash").primaryKey(), // SHA-256 hash of the session token
-    address: text("address").notNull(), // lowercase Starknet wallet address
+    tokenHash: text("token_hash").primaryKey(),
+    address: text("address").notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     expiresAt: timestamp("expires_at").notNull(),
     absoluteExpiresAt: timestamp("absolute_expires_at").notNull(),
     revokedAt: timestamp("revoked_at"),
     lastSeen: timestamp("last_seen"),
+    // BE-154: groups every token descended from one login, so the whole
+    // chain can be revoked at once if a rotated-out token is reused.
+    familyId: text("family_id"),
+    // BE-154: set the moment this token is rotated out. A non-null value
+    // being presented again means someone replayed a stale refresh token.
+    rotatedAt: timestamp("rotated_at"),
   },
   (table) => ({
     addressIdx: index("sessions_address_idx").on(table.address),
+    familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );

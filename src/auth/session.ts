@@ -94,11 +94,13 @@ export function consumeChallenge(address: string) {
 export async function createSession(address: string) {
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const familyId = crypto.randomUUID();
   const now = Date.now();
 
   await db.insert(sessionsTable).values({
     tokenHash,
     address: address.toLowerCase(),
+    familyId,
     expiresAt: new Date(now + SESSION_TTL_MS),
     absoluteExpiresAt: new Date(now + SESSION_MAX_TTL_MS),
   });
@@ -159,6 +161,7 @@ export async function requireSession(address: string, token: string): Promise<bo
  * @param token - The raw session token to revoke
  */
 export async function revokeSession(token: string): Promise<void> {
+
   if (!token) return;
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
 
@@ -166,6 +169,107 @@ export async function revokeSession(token: string): Promise<void> {
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
     .where(eq(sessionsTable.tokenHash, tokenHash));
+}
+
+export type RotateResult =
+  | { ok: true; token: string; expires_in_ms: number }
+  | { ok: false; reason: "invalid" }
+  | { ok: false; reason: "reused"; familyId: string };
+
+/**
+ * Rotates a refresh (session) token: validates the presented token, issues a
+ * brand-new one in the same token family, and marks the old one as rotated
+ * so it can never be used again.
+ *
+ * If the presented token has ALREADY been rotated out (or already revoked),
+ * this is treated as a compromise signal — someone is replaying a stale
+ * token — and the entire token family is revoked immediately.
+ *
+ * @param address - The Starknet wallet address
+ * @param token - The raw refresh token being presented
+ */
+export async function rotateSession(address: string, token: string): Promise<RotateResult> {
+  if (!token || !address) return { ok: false, reason: "invalid" };
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const now = new Date();
+
+  const [session] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+
+  if (!session || session.address !== address.toLowerCase()) {
+    return { ok: false, reason: "invalid" };
+  }
+
+  // Fallback for rows created before this migration: treat the token itself
+  // as the root of its own family so future rotations still chain correctly.
+  const familyId = session.familyId ?? session.tokenHash;
+
+  if (session.rotatedAt !== null || session.revokedAt !== null) {
+    await revokeFamily(familyId);
+    return { ok: false, reason: "reused", familyId };
+  }
+
+  if (
+    session.expiresAt.getTime() < now.getTime() ||
+    session.absoluteExpiresAt.getTime() < now.getTime()
+  ) {
+    return { ok: false, reason: "invalid" };
+  }
+
+  const newToken = crypto.randomBytes(24).toString("hex");
+  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
+  const nowMs = now.getTime();
+  let newExpiresAtMs = nowMs + SESSION_TTL_MS;
+  if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
+    newExpiresAtMs = session.absoluteExpiresAt.getTime();
+  }
+
+  // Issue the replacement before marking the old one rotated, so a failure
+  // here leaves the old token intact instead of orphaning the session.
+  await db.insert(sessionsTable).values({
+    tokenHash: newTokenHash,
+    address: session.address,
+    familyId,
+    expiresAt: new Date(newExpiresAtMs),
+    absoluteExpiresAt: session.absoluteExpiresAt,
+  });
+
+  await db
+    .update(sessionsTable)
+    .set({ rotatedAt: now })
+    .where(eq(sessionsTable.tokenHash, tokenHash));
+
+  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
+}
+
+/**
+ * Revokes every token in a rotation family (used when reuse of a stale,
+ * already-rotated token is detected — a likely token-theft signal).
+ *
+ * @param familyId - The token family identifier
+ */
+export async function revokeFamily(familyId: string): Promise<void> {
+  await db
+    .update(sessionsTable)
+    .set({ revokedAt: new Date() })
+    .where(eq(sessionsTable.familyId, familyId));
+}
+
+/**
+ * Revokes every outstanding session/refresh token belonging to a user,
+ * regardless of family. Used by the /auth/revoke endpoint (e.g. "sign out
+ * everywhere" or an admin-triggered account lockdown).
+ *
+ * @param address - The Starknet wallet address
+ */
+export async function revokeAllSessionsForAddress(address: string): Promise<void> {
+  await db
+    .update(sessionsTable)
+    .set({ revokedAt: new Date() })
+    .where(eq(sessionsTable.address, address.toLowerCase()));
 }
 
 /**
