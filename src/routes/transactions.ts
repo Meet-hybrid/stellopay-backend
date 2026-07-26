@@ -7,10 +7,41 @@ import { toHexString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { env } from "../config.js";
 import { formatTokenAmount, getTokenInfo as resolveTokenInfo, type TokenInfo } from "../utils/token-formatting.js";
+import { requireAuth } from "../auth/middleware.js";
 
 const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
+
+/**
+ * Explicit allowlist of every event-type value that may appear in the
+ * `eventTypes` query parameter. Values outside this set are rejected before
+ * they reach any DB call, so callers cannot inject arbitrary strings into
+ * the `inArray()` filter or probe for unknown table values.
+ */
+const ALLOWED_EVENT_TYPES = new Set([
+  // WorkAgreement events
+  "AgreementCreated",
+  "AgreementActivated",
+  "AgreementPaused",
+  "AgreementResumed",
+  "AgreementCancelled",
+  "AgreementCompleted",
+  "AgreementStatusChange",
+  "PaymentSent",
+  "PaymentReceived",
+  "MilestoneAdded",
+  "MilestoneApproved",
+  "MilestoneClaimed",
+  "EmployeeAdded",
+  "PayrollClaimed",
+  "DisputeRaised",
+  "DisputeResolved",
+  // PayrollEscrow events
+  "Funded",
+  "Released",
+  "Refunded",
+]);
 
 /**
  * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
@@ -287,22 +318,45 @@ function formatEventType(eventType: string): string {
 }
 
 // Get all transactions for a user (from payments and escrow events)
-transactionsRouter.get("/transactions/:user_address", async (req, res, next) => {
+transactionsRouter.get("/transactions/:user_address", requireAuth, async (req, res, next) => {
   try {
     const userAddress = normalizeAddr(req.params.user_address);
+
+    // Authorization: the authenticated session address must match the requested address.
+    // This prevents any authenticated user from reading another user's transaction history.
+    const authenticatedAddress = normalizeAddr(req.auth!.address);
+    if (authenticatedAddress !== userAddress) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+
     const requestedLimit =
       z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
     const limit = Math.min(requestedLimit, 100);
     const offset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
     const queryLimit = offset + limit;
 
-    // Get filter for event types (comma-separated list)
-    const eventTypesFilter = req.query.eventTypes
+    // Get filter for event types (comma-separated list).
+    // Values are validated against the ALLOWED_EVENT_TYPES allowlist before they
+    // reach any DB call, preventing injection of arbitrary strings into inArray().
+    const rawEventTypes = req.query.eventTypes
       ? (req.query.eventTypes as string)
           .split(",")
           .map((t) => t.trim())
           .filter((t) => t.length > 0)
       : null;
+
+    if (rawEventTypes) {
+      const unknown = rawEventTypes.filter((t) => !ALLOWED_EVENT_TYPES.has(t));
+      if (unknown.length > 0) {
+        res.status(400).json({
+          error: `Unknown event type(s): ${unknown.join(", ")}. Allowed values: ${[...ALLOWED_EVENT_TYPES].join(", ")}`,
+        });
+        return;
+      }
+    }
+
+    const eventTypesFilter = rawEventTypes;
 
     // Get payments where user is sender or receiver
     const paymentConditions = [
@@ -667,11 +721,41 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
     next(e);
   }
 });
-transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, next) => {
+transactionsRouter.get("/transactions/:user_address/filtered", requireAuth, async (req, res, next) => {
   try {
     const userAddress = normalizeAddr(req.params.user_address);
-    const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
-    const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
+
+    // Authorization: the authenticated session address must match the requested address.
+    const authenticatedAddress = normalizeAddr(req.auth!.address);
+    if (authenticatedAddress !== userAddress) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+
+    // Parse and validate date inputs — reject invalid date strings up front so
+    // they do not produce silent NaN comparisons in gte()/lte() DB calls.
+    let startDate: Date | undefined;
+    let endDate: Date | undefined;
+
+    if (req.query.startDate) {
+      startDate = new Date(req.query.startDate as string);
+      if (isNaN(startDate.getTime())) {
+        res.status(400).json({ error: "Invalid startDate — expected an ISO 8601 date string." });
+        return;
+      }
+    }
+    if (req.query.endDate) {
+      endDate = new Date(req.query.endDate as string);
+      if (isNaN(endDate.getTime())) {
+        res.status(400).json({ error: "Invalid endDate — expected an ISO 8601 date string." });
+        return;
+      }
+    }
+
+    if (startDate && endDate && startDate > endDate) {
+      res.status(400).json({ error: "startDate must not be after endDate." });
+      return;
+    }
     const requestedLimit =
       z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
     const limit = Math.min(requestedLimit, 100);
