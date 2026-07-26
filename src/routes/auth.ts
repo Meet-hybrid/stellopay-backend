@@ -128,19 +128,15 @@ authRouter.post("/auth/logout", requireAuth, async (req, res, next) => {
 
 // Step 3.5: rotate a refresh token on every use. Detects reuse of an
 // already-rotated (stale) token and revokes the whole token family — a
-// possible token-theft signal, not just a normal auth failure.
+// possible token-theft signal, not just a normal auth failure. The
+// reuse-detection log is emitted by `rotateSession` itself
+// (event="session.reuse_detected"), so no extra console.warn here.
 authRouter.post("/auth/refresh", async (req, res, next) => {
   try {
     const { address, refresh_token } = RefreshBody.parse(req.body);
     const result = await rotateSession(address, refresh_token);
 
     if (!result.ok) {
-      if (result.reason === "reused") {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[auth] Reuse of rotated refresh token detected (family ${result.familyId}); family revoked`,
-        );
-      }
       res.status(401).json({ ok: false, error: "Invalid refresh token" });
       return;
     }

@@ -12,12 +12,189 @@ import {
   main,
   withMigrationLock,
 } from "./migrate.js";
+import { getTableConfig } from "drizzle-orm/pg-core";
+import {
+  agreements,
+  agreementEvents,
+  payments,
+  milestones,
+  employees,
+  escrowEvents,
+  billingProfiles,
+  billingPaymentMethods,
+  billingInvoices,
+} from "./schema.js";
 
 vi.mock("drizzle-orm/node-postgres/migrator", () => ({
   migrate: vi.fn(),
 }));
 
 const describeDbMigration = process.env.RUN_DB_MIGRATION_TESTS === "1" ? describe : describe.skip;
+
+// ---------------------------------------------------------------------------
+// Helper: extract CHECK constraint names declared on a table
+// ---------------------------------------------------------------------------
+function getCheckConstraintNames(table: Parameters<typeof getTableConfig>[0]): string[] {
+  const config = getTableConfig(table);
+  // Drizzle exposes check constraints under config.checks
+  const checks = (config as { checks?: Array<{ name: string }> }).checks ?? [];
+  return checks.map((c) => c.name);
+}
+
+// ---------------------------------------------------------------------------
+// Schema CHECK constraint declarations
+// ---------------------------------------------------------------------------
+
+describe("schema check constraints", () => {
+  describe("agreements", () => {
+    it("declares check constraints for mode, paymentType, status, disputeStatus, blockNumber, and u256 amounts", () => {
+      const names = getCheckConstraintNames(agreements);
+      expect(names).toContain("agreements_mode_check");
+      expect(names).toContain("agreements_payment_type_check");
+      expect(names).toContain("agreements_status_check");
+      expect(names).toContain("agreements_dispute_status_check");
+      expect(names).toContain("agreements_block_number_check");
+      expect(names).toContain("agreements_total_amount_check");
+      expect(names).toContain("agreements_paid_amount_check");
+    });
+  });
+
+  describe("agreement_events", () => {
+    it("declares check constraints for blockNumber and eventIndex", () => {
+      const names = getCheckConstraintNames(agreementEvents);
+      expect(names).toContain("agreement_events_block_number_check");
+      expect(names).toContain("agreement_events_event_index_check");
+    });
+  });
+
+  describe("payments", () => {
+    it("declares check constraints for blockNumber, amount, and eventType", () => {
+      const names = getCheckConstraintNames(payments);
+      expect(names).toContain("payments_block_number_check");
+      expect(names).toContain("payments_amount_check");
+      expect(names).toContain("payments_event_type_check");
+    });
+  });
+
+  describe("milestones", () => {
+    it("declares check constraints for milestoneId, blockNumber, and amount", () => {
+      const names = getCheckConstraintNames(milestones);
+      expect(names).toContain("milestones_milestone_id_check");
+      expect(names).toContain("milestones_block_number_check");
+      expect(names).toContain("milestones_amount_check");
+    });
+  });
+
+  describe("employees", () => {
+    it("declares check constraints for employeeIndex, claimedPeriods, blockNumber, and salary", () => {
+      const names = getCheckConstraintNames(employees);
+      expect(names).toContain("employees_employee_index_check");
+      expect(names).toContain("employees_claimed_periods_check");
+      expect(names).toContain("employees_block_number_check");
+      expect(names).toContain("employees_salary_per_period_check");
+    });
+  });
+
+  describe("escrow_events", () => {
+    it("declares check constraints for blockNumber, amount, and eventType", () => {
+      const names = getCheckConstraintNames(escrowEvents);
+      expect(names).toContain("escrow_events_block_number_check");
+      expect(names).toContain("escrow_events_amount_check");
+      expect(names).toContain("escrow_events_event_type_check");
+    });
+  });
+
+  describe("billing_profiles", () => {
+    it("declares check constraints for profileType, currency, and reward limits", () => {
+      const names = getCheckConstraintNames(billingProfiles);
+      expect(names).toContain("billing_profiles_profile_type_check");
+      expect(names).toContain("billing_profiles_currency_check");
+      expect(names).toContain("billing_profiles_annual_reward_limit_check");
+      expect(names).toContain("billing_profiles_used_amount_check");
+    });
+  });
+
+  describe("billing_payment_methods", () => {
+    it("declares a check constraint for type", () => {
+      const names = getCheckConstraintNames(billingPaymentMethods);
+      expect(names).toContain("billing_payment_methods_type_check");
+    });
+  });
+
+  describe("billing_invoices", () => {
+    it("declares check constraints for status, currency, and amount", () => {
+      const names = getCheckConstraintNames(billingInvoices);
+      expect(names).toContain("billing_invoices_status_check");
+      expect(names).toContain("billing_invoices_currency_check");
+      expect(names).toContain("billing_invoices_amount_check");
+    });
+  });
+
+  describe("u256 decimal format validation", () => {
+    // Documents and tests the regex used in CHECK constraints for u256 columns.
+    // The pattern is: ^(0|[1-9][0-9]{0,77})$
+    // – accepts "0" and positive integers up to 78 digits (the max decimal
+    //   width of 2^256 - 1); rejects leading zeros, negatives, decimals, etc.
+
+    const validU256Values = [
+      ["zero", "0"],
+      ["one", "1"],
+      ["large number", "123456789"],
+      ["78-digit max", "1" + "0".repeat(77)],
+    ] as const;
+
+    const invalidU256Values = [
+      ["empty string", ""],
+      ["negative", "-1"],
+      ["leading zero", "01"],
+      ["decimal point", "1.5"],
+      ["non-numeric", "abc"],
+      ["leading space", " 1"],
+      ["trailing space", "1 "],
+      ["79 digits", "1" + "0".repeat(78)],
+    ] as const;
+
+    it.each(validU256Values)("accepts valid u256 value (%s): %s", (_label, value) => {
+      const regex = /^(0|[1-9][0-9]{0,77})$/;
+      expect(regex.test(value)).toBe(true);
+    });
+
+    it.each(invalidU256Values)("rejects invalid u256 value (%s): %s", (_label, value) => {
+      const regex = /^(0|[1-9][0-9]{0,77})$/;
+      expect(regex.test(value)).toBe(false);
+    });
+  });
+
+  describe("currency code format validation", () => {
+    // Documents the regex used in CHECK constraints for currency columns.
+    // Accepts exactly three uppercase ASCII letters (ISO 4217 style).
+
+    const validCurrencies = [
+      ["USD", "USD"],
+      ["EUR", "EUR"],
+      ["GBP", "GBP"],
+      ["JPY", "JPY"],
+    ] as const;
+
+    const invalidCurrencies = [
+      ["empty string", ""],
+      ["lowercase", "usd"],
+      ["too short", "US"],
+      ["too long", "USDD"],
+      ["digits", "123"],
+    ] as const;
+
+    it.each(validCurrencies)("accepts valid currency code (%s)", (_label, code) => {
+      const regex = /^[A-Z]{3}$/;
+      expect(regex.test(code)).toBe(true);
+    });
+
+    it.each(invalidCurrencies)("rejects invalid currency code (%s)", (_label, code) => {
+      const regex = /^[A-Z]{3}$/;
+      expect(regex.test(code)).toBe(false);
+    });
+  });
+});
 
 describe("migration dry-run helpers", () => {
   it("lists migrations newer than the last applied migration timestamp", () => {
@@ -88,6 +265,8 @@ describe("migration CLI", () => {
     expect(log).toHaveBeenCalledWith("Pending migrations:");
     expect(log).toHaveBeenCalledWith("0000_faulty_mole_man.sql");
     expect(log).toHaveBeenCalledWith("0001_faulty_blue_blade.sql");
+    expect(log).toHaveBeenCalledWith("0002_hard_onslaught.sql");
+    expect(log).toHaveBeenCalledWith("0003_schema_check_constraints.sql");
     expect(end).toHaveBeenCalledOnce();
   });
 
@@ -308,6 +487,8 @@ describeDbMigration("Database migration integration test", () => {
     expect(output).toContain("Pending migrations:");
     expect(output).toContain("0000_faulty_mole_man.sql");
     expect(output).toContain("0001_faulty_blue_blade.sql");
+    expect(output).toContain("0002_hard_onslaught.sql");
+    expect(output).toContain("0003_schema_check_constraints.sql");
 
     const client = new pg.Client({ connectionString });
     await client.connect();
