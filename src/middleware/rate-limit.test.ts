@@ -1,8 +1,8 @@
 import express from "express";
 import request from "supertest";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 
-import { makeLimiter, keyByIp } from "./rate-limit";
+import { makeLimiter, keyByIp, retryAfterSeconds } from "./rate-limit";
 
 /**
  * Build a minimal app that mounts the given limiter on `/api` and exposes a
@@ -17,6 +17,10 @@ function makeApp(limiter: express.RequestHandler) {
   app.get("/health", (_req, res) => res.json({ ok: true }));
   return app;
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("makeLimiter", () => {
   it("returns a usable Express middleware function", () => {
@@ -100,7 +104,77 @@ describe("makeLimiter", () => {
     expect(res.headers["x-ratelimit-limit"]).toBeUndefined();
     expect(res.headers["ratelimit-limit"]).toBeUndefined();
   });
+
+  // ---------------------------------------------------------------------------
+  // Retry-After header
+  // ---------------------------------------------------------------------------
+
+  it("sends a Retry-After header on every 429 response", async () => {
+    const windowMs = 60_000;
+    const app = makeApp(makeLimiter({ name: "retry-after", windowMs, max: 1 }));
+
+    await request(app).get("/api/ping").expect(200);
+    const blocked = await request(app).get("/api/ping");
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    // Value must be a positive integer string.
+    const value = Number(blocked.headers["retry-after"]);
+    expect(Number.isInteger(value)).toBe(true);
+    expect(value).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not send Retry-After on allowed (non-429) responses", async () => {
+    const app = makeApp(makeLimiter({ name: "no-retry-header", windowMs: 60_000, max: 5 }));
+    const res = await request(app).get("/api/ping").expect(200);
+    expect(res.headers["retry-after"]).toBeUndefined();
+  });
+
+  it("sets Retry-After to the ceiling of windowMs / 1000", async () => {
+    // windowMs = 90_000 ms → 90 s
+    const windowMs = 90_000;
+    const app = makeApp(makeLimiter({ name: "retry-after-value", windowMs, max: 1 }));
+
+    await request(app).get("/api/ping").expect(200);
+    const blocked = await request(app).get("/api/ping").expect(429);
+
+    expect(Number(blocked.headers["retry-after"])).toBe(90);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Observability: log on limit reached
+  // ---------------------------------------------------------------------------
+
+  it("logs a warning when the limit is reached", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const app = makeApp(makeLimiter({ name: "observable", windowMs: 60_000, max: 1 }));
+
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(429);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('limiter="observable"'),
+    );
+  });
+
+  it("does not log a warning on allowed requests", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const app = makeApp(makeLimiter({ name: "no-warn", windowMs: 60_000, max: 5 }));
+
+    await request(app).get("/api/ping").expect(200);
+
+    // The warn spy may have been called by keyByIp for an unresolved IP,
+    // but must NOT have been called with the limit-reached message.
+    const limitWarnings = warnSpy.mock.calls.filter(([msg]) =>
+      String(msg).includes("limit reached"),
+    );
+    expect(limitWarnings).toHaveLength(0);
+  });
 });
+
+// ---------------------------------------------------------------------------
+// keyByIp
+// ---------------------------------------------------------------------------
 
 describe("keyByIp", () => {
   it("returns req.ip when present", () => {
@@ -108,7 +182,22 @@ describe("keyByIp", () => {
   });
 
   it("falls back to 'unknown' when the IP cannot be resolved", () => {
-    expect(keyByIp({ ip: undefined } as unknown as express.Request)).toBe("unknown");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const key = keyByIp({ ip: undefined } as unknown as express.Request);
+    expect(key).toBe("unknown");
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("req.ip is undefined"));
+  });
+
+  it("emits a warn when IP is undefined so operators notice misconfigured proxy", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    keyByIp({ ip: undefined } as unknown as express.Request);
+    expect(warnSpy).toHaveBeenCalledOnce();
+  });
+
+  it("does not warn when IP is present", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    keyByIp({ ip: "1.2.3.4" } as express.Request);
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it("keys distinct client IPs separately (no cross-IP throttling)", async () => {
@@ -120,5 +209,29 @@ describe("keyByIp", () => {
 
     // Client B (different forwarded IP) is unaffected.
     await request(app).get("/api/ping").set("X-Forwarded-For", "198.51.100.2").expect(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// retryAfterSeconds
+// ---------------------------------------------------------------------------
+
+describe("retryAfterSeconds", () => {
+  it("converts milliseconds to whole seconds (ceiling)", () => {
+    expect(retryAfterSeconds(60_000)).toBe(60);
+    expect(retryAfterSeconds(90_000)).toBe(90);
+    expect(retryAfterSeconds(1_500)).toBe(2); // 1.5 s → ceiling → 2
+  });
+
+  it("returns at least 1 for very short windows", () => {
+    expect(retryAfterSeconds(0)).toBe(1);
+    expect(retryAfterSeconds(500)).toBe(1); // 0.5 s → ceiling → 1
+    expect(retryAfterSeconds(1)).toBe(1);   // sub-ms → ceiling → 1
+  });
+
+  it("handles standard window values correctly", () => {
+    expect(retryAfterSeconds(15 * 60 * 1000)).toBe(900);  // 15 min
+    expect(retryAfterSeconds(5 * 60 * 1000)).toBe(300);   // 5 min
+    expect(retryAfterSeconds(60 * 60 * 1000)).toBe(3600); // 1 hour
   });
 });
