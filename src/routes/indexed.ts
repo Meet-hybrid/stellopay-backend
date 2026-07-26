@@ -2,11 +2,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
-import {
-  StarknetAddress,
-  AgreementId,
-  parsePagination,
-} from "../utils/validation.js";
+import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const indexedRouter = Router();
 
@@ -37,42 +34,54 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+        res.status(400).json({ error: "Invalid contract address for agreements" });
+        return;
+      }
       const userAddress = StarknetAddress.parse(req.params.user_address);
       const { limit, offset } = parsePagination(req.query);
 
-      const agreements = await db
-        .select()
-        .from(schema.agreements)
-        .where(
-          and(
-            eq(schema.agreements.contractAddress, contractAddress),
-            or(
-              eq(schema.agreements.employer, userAddress),
-              eq(schema.agreements.contributor, userAddress),
+      // Find agreements where user is employer or contributor, and separately
+      // check if the user is an employee in any payroll agreements. These two
+      // queries don't depend on each other, so run them concurrently instead
+      // of paying for two sequential round trips.
+      const [agreements, employeeAgreements] = await Promise.all([
+        db
+          .select()
+          .from(schema.agreements)
+          .where(
+            and(
+              eq(schema.agreements.contractAddress, contractAddress),
+              or(
+                eq(schema.agreements.employer, userAddress),
+                eq(schema.agreements.contributor, userAddress),
+              ),
             ),
-          ),
-        )
-        .orderBy(desc(schema.agreements.createdAt))
-        .limit(limit)
-        .offset(offset);
+          )
+          .orderBy(desc(schema.agreements.createdAt))
+          .limit(limit)
+          .offset(offset),
 
-      const employeeAgreements = await db
-        .select({ agreement: schema.agreements })
-        .from(schema.agreements)
-        .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
-        .where(
-          and(
-            eq(schema.agreements.contractAddress, contractAddress),
-            eq(schema.employees.employeeAddress, userAddress),
-            eq(schema.agreements.mode, 1),
-          ),
-        )
-        .orderBy(desc(schema.agreements.createdAt))
-        .limit(limit);
+        db
+          .select({
+            agreement: schema.agreements,
+          })
+          .from(schema.agreements)
+          .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
+          .where(
+            and(
+              eq(schema.agreements.contractAddress, contractAddress),
+              eq(schema.employees.employeeAddress, userAddress),
+              eq(schema.agreements.mode, 1), // Payroll mode
+            ),
+          )
+          .orderBy(desc(schema.agreements.createdAt))
+          .limit(limit),
+      ]);
 
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
       const uniqueAgreements = Array.from(
-        new Map(allAgreements.map((a) => [a.id, a])).values()
+        new Map(allAgreements.map((a) => [a.id, a])).values(),
       ).slice(0, limit);
 
       res.json({
@@ -90,6 +99,10 @@ indexedRouter.get(
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
+    if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+      res.status(400).json({ error: "Invalid contract address for agreement details" });
+      return;
+    }
     const agreementId = AgreementId.parse(req.params.agreement_id);
 
     const agreement = await db
@@ -104,7 +117,8 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       .limit(1);
 
     if (agreement.length === 0) {
-      return res.status(404).json({ error: "Agreement not found" });
+      notFoundResponse(res, "Agreement not found");
+      return;
     }
 
     // HARDENING: We now apply .limit() to all related queries to prevent unbounded result sets
@@ -169,6 +183,10 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      if (contractAddress !== normalizeAddr(defaults.payrollEscrowAddress)) {
+        res.status(400).json({ error: "Invalid contract address for escrow balance" });
+        return;
+      }
       const agreementId = AgreementId.parse(req.params.agreement_id);
 
       // We bound this query to 500 events; calculating balance for more than 500 

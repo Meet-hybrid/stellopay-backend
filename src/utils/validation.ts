@@ -14,12 +14,42 @@ import { normalizeStarknetAddress } from "./address.js";
  * StarknetAddress.parse("0x4718F5a..."); // canonical normalized address
  * StarknetAddress.parse("abc");          // also accepted, normalized to 0x..0abc
  */
+
+interface ValidationErrorMetric {
+  validator: string;
+  input: string;
+  error: string;
+  timestamp: string;
+}
+
+function logValidationError(metric: ValidationErrorMetric): void {
+  console.warn(`[validation:error] ${JSON.stringify(metric)}`);
+}
+
+/**
+ * Wraps a Zod schema with error logging. On parse failure, logs structured
+ * diagnostics before re-throwing so production failures are traceable.
+ */
+export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    logValidationError({
+      validator: validatorName,
+      input: typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40),
+      error: result.error.issues.map((i) => i.message).join("; "),
+      timestamp: new Date().toISOString(),
+    });
+    throw result.error;
+  }
+  return result.data;
+}
+
 export const StarknetAddress = z
   .string()
   .trim()
   .regex(
     /^(0x)?[0-9a-fA-F]{1,64}$/,
-    "must be a hex string of up to 64 hex characters, with an optional 0x prefix"
+    "must be a hex string of up to 64 hex characters, with an optional 0x prefix",
   )
   .transform((value) => normalizeStarknetAddress(value));
 
@@ -54,6 +84,23 @@ export const DEFAULT_PAGE_LIMIT = 50;
  * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
  * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
  */
+/**
+ * Normalizes "missing-like" values — an explicit `null` or empty string — to
+ * `undefined` before delegating to Zod so the `.catch()` fallback engages.
+ *
+ * Without this normalization, Zod's `z.coerce.number()` would coerce both
+ * `null` and `""` to the number `0`, which then passes `.int()` and is
+ * silently clamped to a limit of `1`. That is a fail-open that bypasses
+ * {@link DEFAULT_PAGE_LIMIT} and makes a pagination request return only a
+ * single row — inconsistent with `undefined`, which falls back to the
+ * documented default. Treating `null` / `""` and `undefined` uniformly
+ * removes the inconsistency.
+ */
+function coerceNullOrEmptyToUndefined(value: unknown): unknown {
+  if (value === null || value === "") return undefined;
+  return value;
+}
+
 export function parsePagination(query: unknown): {
   limit: number;
   offset: number;
@@ -63,8 +110,12 @@ export function parsePagination(query: unknown): {
     .number()
     .int()
     .catch(DEFAULT_PAGE_LIMIT)
-    .parse(source.limit);
-  const offsetRaw = z.coerce.number().int().catch(0).parse(source.offset);
+    .parse(coerceNullOrEmptyToUndefined(source.limit));
+  const offsetRaw = z.coerce
+    .number()
+    .int()
+    .catch(0)
+    .parse(coerceNullOrEmptyToUndefined(source.offset));
   return {
     limit: Math.min(Math.max(limitRaw, 1), MAX_PAGE_LIMIT),
     offset: Math.max(offsetRaw, 0),

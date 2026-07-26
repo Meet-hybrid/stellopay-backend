@@ -7,33 +7,33 @@ import { formatTokenAmount, getTokenInfo } from "../utils/token-formatting.js";
 
 export const notificationsRouter = Router();
 
+export interface NotificationPreferences {
+  payments: boolean;
+  agreements: boolean;
+  escrow: boolean;
+  disputes: boolean;
+}
+
 /**
- * 1. CONTRACT DEFINITIONS
- * We define strict schemas so the runtime, tests, and docs all share the same source of truth.
+ * Returns default notification category preferences for users (all categories enabled).
  */
-const NotificationPreferencesSchema = z.object({
-  email: z.boolean().default(true),
-  push: z.boolean().default(true),
-  marketing: z.boolean().default(false),
-}).strict(); // .strict() rejects unknown fields
+export function getDefaultNotificationPreferences(): NotificationPreferences {
+  return {
+    payments: true,
+    agreements: true,
+    escrow: true,
+    disputes: true,
+  };
+}
 
-const NotificationItemSchema = z.object({
-  id: z.string().or(z.number()),
-  title: z.string(),
-  message: z.string(),
-  read: z.boolean(),
-  date: z.string().datetime(),
-  type: z.string(),
-  txHash: z.string(),
-});
+/**
+ * Computes the total unread count from a list of notification items.
+ */
+export function calculateUnreadCount(notifications: Array<{ read: boolean }>): number {
+  return notifications.filter((n) => !n.read).length;
+}
 
-const UnreadCountSchema = z.object({
-  count: z.number().int().nonnegative(),
-});
-
-// --- ROUTES ---
-
-// GET notifications for a user
+// Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
@@ -131,44 +131,15 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, limit);
 
-    // Hardening: Validate output against schema to ensure no malformed data leaves the route
-    const validatedNotifications = z.array(NotificationItemSchema).parse(rawNotifications);
+    const unreadCount = calculateUnreadCount(notifications);
 
-    res.json({ notifications: validatedNotifications, total: validatedNotifications.length });
+    res.json({
+      notifications,
+      total: notifications.length,
+      unreadCount,
+    });
   } catch (e) {
     next(e);
   }
 });
 
-// GET unread count
-notificationsRouter.get("/notifications/:user_address/unread-count", async (req, res, next) => {
-  try {
-    const userAddress = StarknetAddress.parse(req.params.user_address);
-    
-    // In a real app, this would query a 'notifications' table with a 'read' status.
-    // Based on the current code logic, we assume events are unread by default.
-    const count = await db.$count(schema.payments, or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)));
-    
-    // Harden the response using the schema
-    const response = UnreadCountSchema.parse({ count: Math.max(0, count) });
-    res.json(response);
-  } catch (e) {
-    next(e);
-  }
-});
-
-// PATCH notification preferences
-notificationsRouter.patch("/notifications/:user_address/preferences", async (req, res, next) => {
-  try {
-    const _userAddress = StarknetAddress.parse(req.params.user_address);
-    
-    // Strict validation of the body
-    const preferences = NotificationPreferencesSchema.parse(req.body);
-
-    // Logic to save 'preferences' to the database would go here.
-    // For now, we return the validated preferences to satisfy the contract.
-    res.json({ success: true, preferences });
-  } catch (e) {
-    next(e);
-  }
-});

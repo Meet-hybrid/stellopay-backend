@@ -81,7 +81,11 @@ vi.mock("drizzle-orm", () => ({
   inArray: vi.fn((column: unknown, values: unknown) => ({ type: "inArray", column, values })),
 }));
 
-import { notificationsRouter } from "./notifications.js";
+import {
+  notificationsRouter,
+  getDefaultNotificationPreferences,
+  calculateUnreadCount,
+} from "./notifications.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
 function makeApp() {
@@ -116,37 +120,134 @@ beforeEach(() => {
   queryState.mockCount = 0;
 });
 
+describe("notification preferences & unread count helpers", () => {
+  it("provides default notification preferences enabled for all categories", () => {
+    const prefs = getDefaultNotificationPreferences();
+    expect(prefs).toEqual({
+      payments: true,
+      agreements: true,
+      escrow: true,
+      disputes: true,
+    });
+  });
+
+  it("calculates unread count correctly from notification objects", () => {
+    const list = [{ read: false }, { read: true }, { read: false }];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+});
+
 describe("notifications route", () => {
-  // ... (Keep existing notification list tests identical to your previous code) ...
-  it("validates and normalizes the address and returns sorted notifications", async () => {
-    queryState.rows.payments = [{
-        id: "p1", eventType: "PaymentReceived", transactionHash: "0x1", 
-        amount: "100", createdAt: new Date("2026-01-01T00:00:00Z") 
-    }];
+  it("validates and normalizes the address and returns sorted notifications with unreadCount", async () => {
+    queryState.rows.payments = [
+      {
+        id: "payment-1",
+        eventType: "PaymentReceived",
+        transactionHash: "0xpayment0001",
+        amount: "1000000",
+        token: undefined,
+        createdAt: new Date("2026-03-02T00:00:00Z"),
+      },
+    ];
+    queryState.rows.agreements = [{ id: "1" }];
+    queryState.rows.agreementEvents = [
+      {
+        id: "event-1",
+        eventType: "AgreementCreated",
+        agreementId: "1",
+        transactionHash: "0xevent0001",
+        createdAt: new Date("2026-03-03T00:00:00Z"),
+      },
+    ];
+    queryState.rows.escrowEvents = [
+      {
+        id: "escrow-1",
+        eventType: "Funded",
+        agreementId: "1",
+        amount: "2000000",
+        transactionHash: "0xescrow0001",
+        createdAt: new Date("2026-03-01T00:00:00Z"),
+      },
+    ];
+
     const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
     expect(res.body.notifications).toHaveLength(1);
   });
 });
 
-/**
- * NEW: Tests for Unread Count Hardening
- */
-describe("unread-count route", () => {
-  it("returns a valid non-negative count", async () => {
-    queryState.mockCount = 5;
-    const res = await request(makeApp())
-      .get("/api/v1/notifications/0x123/unread-count")
-      .expect(200);
-
-    expect(res.body).toEqual({ count: 5 });
+    expect(res.body.total).toBe(3);
+    expect(res.body.unreadCount).toBe(3);
+    expect(res.body.notifications).toHaveLength(3);
+    expect(res.body.notifications.map((n: { id: string }) => n.id)).toEqual([
+      "event-1",
+      "payment-1",
+      "escrow-1",
+    ]);
+    expect(queryState.limitCalls.every((limit) => limit === 10)).toBe(true);
+    expect(queryState.eqValues).toContain(normalizeStarknetAddress("abc"));
   });
 
-  it("coerces negative database values to 0 (Boundary Path)", async () => {
-    // Simulate a DB glitch returning -1
-    queryState.mockCount = -1;
-    const res = await request(makeApp())
-      .get("/api/v1/notifications/0x123/unread-count")
-      .expect(200);
+
+  it("maps every payment, agreement, and escrow event type to its notification title", async () => {
+    queryState.rows.payments = [
+      {
+        id: "payment-sent",
+        eventType: "PaymentSent",
+        transactionHash: "0xpaymentsent",
+        amount: "500000",
+        token: undefined,
+        createdAt: new Date("2026-02-10T00:00:00Z"),
+      },
+    ];
+    queryState.rows.agreements = [{ id: "1" }];
+    queryState.rows.agreementEvents = [
+      {
+        id: "dispute-raised",
+        eventType: "DisputeRaised",
+        agreementId: "1",
+        transactionHash: "0xa1",
+        createdAt: new Date("2026-02-09T00:00:00Z"),
+      },
+      {
+        id: "dispute-resolved",
+        eventType: "DisputeResolved",
+        agreementId: "1",
+        transactionHash: "0xa2",
+        createdAt: new Date("2026-02-08T00:00:00Z"),
+      },
+      {
+        id: "activated",
+        eventType: "AgreementActivated",
+        agreementId: "1",
+        transactionHash: "0xa3",
+        createdAt: new Date("2026-02-07T00:00:00Z"),
+      },
+      {
+        id: "cancelled",
+        eventType: "AgreementCancelled",
+        agreementId: "1",
+        transactionHash: "0xa4",
+        createdAt: new Date("2026-02-06T00:00:00Z"),
+      },
+    ];
+    queryState.rows.escrowEvents = [
+      {
+        id: "released",
+        eventType: "Released",
+        agreementId: "1",
+        amount: "700000",
+        transactionHash: "0xe1",
+        createdAt: new Date("2026-02-05T00:00:00Z"),
+      },
+      {
+        id: "refunded",
+        eventType: "Refunded",
+        agreementId: "1",
+        amount: "800000",
+        transactionHash: "0xe2",
+        createdAt: new Date("2026-02-04T00:00:00Z"),
+      },
+    ];
 
     expect(res.body.count).toBe(0);
   });
