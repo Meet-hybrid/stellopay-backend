@@ -13,6 +13,7 @@ import {
 } from "../auth/session.js";
 import { requireAuth } from "../auth/middleware.js";
 import { env } from "../config.js";
+import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
 const AddressBody = z.object({ address: z.string().min(3) });
 const VerifyBody = z.object({
@@ -71,6 +72,12 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
+    
+    if (isLockedOut(address)) {
+      res.status(401).json({ error: "Invalid signature or account locked" });
+      return;
+    }
+
     // Consume (read + delete) the challenge atomically, before the async verify call,
     // so two concurrent requests can't both read it while it's still valid and both
     // pass verification off the same nonce.
@@ -87,14 +94,23 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
     if (!ok) {
-      res.status(401).json({ error: "Invalid signature" });
+      recordFailure(address);
+      res.status(401).json({ error: "Invalid signature or account locked" });
       return;
     }
+    
+    clearFailures(address);
     const session = await createSession(address);
     res.json({
       ok: true,
       address,
       session_token: session.token,
+      // The token returned as `session_token` is also valid as the initial
+      // `refresh_token` for /auth/refresh (createSession issues a single,
+      // dual-role token). Exposing both field names here means a caller
+      // reading only this response can discover that contract without
+      // needing to read /auth/refresh's response shape too.
+      refresh_token: session.token,
       expires_in_ms: session.expires_in_ms,
     });
   } catch (e) {
@@ -152,6 +168,10 @@ authRouter.post("/auth/refresh", async (req, res, next) => {
       ok: true,
       address,
       refresh_token: result.token,
+      // The rotated token is likewise dual-role: it is both the next
+      // refresh_token and a valid bearer session_token for protected
+      // routes / /auth/session/validate. See docs/routes/auth.md.
+      session_token: result.token,
       expires_in_ms: result.expires_in_ms,
     });
   } catch (e) {

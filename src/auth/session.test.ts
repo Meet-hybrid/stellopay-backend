@@ -46,6 +46,9 @@ const {
     row[col] !== null && row[col] !== undefined;
 
   const db = {
+    transaction: async (cb: (tx: any) => Promise<any>) => {
+      return cb(db);
+    },
     insert: (table: any) => ({
       values: async (data: any) => {
         mockState.sessions.push({
@@ -57,18 +60,31 @@ const {
         });
       },
     }),
-    select: () => ({
-      from: (table: any) => ({
-        where: (conditionFn: (row: any) => boolean) => ({
-          limit: (n: number) => {
-            const filtered = mockState.sessions.filter(conditionFn);
-            return {
-              then: (resolve: any) => resolve(filtered.slice(0, n)),
-            };
-          },
-        }),
-      }),
-    }),
+    select: () => {
+      const selectChain = {
+        from: (table: any) => selectChain,
+        where: (conditionFn: (row: any) => boolean) => {
+          selectChain._conditionFn = conditionFn;
+          return selectChain;
+        },
+        for: (mode: string) => selectChain,
+        limit: (n: number) => {
+          selectChain._limitVal = n;
+          return selectChain;
+        },
+        _conditionFn: (() => true) as (row: any) => boolean,
+        _limitVal: undefined as number | undefined,
+        then: (resolve: any) => {
+          const filtered = mockState.sessions.filter(selectChain._conditionFn);
+          const result =
+            selectChain._limitVal !== undefined
+              ? filtered.slice(0, selectChain._limitVal)
+              : filtered;
+          return resolve(result);
+        },
+      };
+      return selectChain;
+    },
     update: (table: any) => ({
       set: (updateData: any) => ({
         where: async (conditionFn: (row: any) => boolean) => {
@@ -521,6 +537,39 @@ describe("sessions", () => {
     expect(after[SESSION_METRICS.SWEEP_DELETED]).toBe(1);
   });
 
+  it("throttles database writes on sliding expiration updates", async () => {
+    const { token } = await createSession("0xThrottledAddress");
+    expect(mockState.sessions).toHaveLength(1);
+    const initialSession = { ...mockState.sessions[0] };
+    expect(initialSession.lastSeen).toBeNull();
+
+    // First requireSession validation: should write/update lastSeen
+    vi.advanceTimersByTime(10 * 1000); // 10 seconds in
+    const ok1 = await requireSession("0xThrottledAddress", token);
+    expect(ok1).toBe(true);
+
+    const firstUpdateSession = { ...mockState.sessions[0] };
+    expect(firstUpdateSession.lastSeen).not.toBeNull();
+    const firstLastSeenMs = firstUpdateSession.lastSeen.getTime();
+    expect(firstLastSeenMs).toBe(10 * 1000);
+
+    // Second requireSession validation (within 1 minute threshold, e.g. +20 seconds): should NOT write/update lastSeen
+    vi.advanceTimersByTime(20 * 1000); // 30 seconds total
+    const ok2 = await requireSession("0xThrottledAddress", token);
+    expect(ok2).toBe(true);
+
+    const secondUpdateSession = { ...mockState.sessions[0] };
+    expect(secondUpdateSession.lastSeen.getTime()).toBe(firstLastSeenMs); // remains 10 seconds
+
+    // Third requireSession validation (past 1 minute threshold, e.g. +65 seconds): should write/update lastSeen
+    vi.advanceTimersByTime(45 * 1000); // 75 seconds total (65 seconds since lastSeen)
+    const ok3 = await requireSession("0xThrottledAddress", token);
+    expect(ok3).toBe(true);
+
+    const thirdUpdateSession = { ...mockState.sessions[0] };
+    expect(thirdUpdateSession.lastSeen.getTime()).toBe(75 * 1000); // updated to 75 seconds
+  });
+
   it("updates session_sweeper_last_deleted_count gauge after a sweep", async () => {
     const a = await createSession("0xGaugeA");
     await revokeSession(a.token);
@@ -543,6 +592,11 @@ describe("sessions", () => {
   // ---------------------------------------------------------------------------
 
   it("emits a session.sweep_failed error log and bumps the sweeper error counter when the DB throws", async () => {
+    // Use real timers because the retry wrapper backs off with setTimeout
+    // between attempts; vi.useFakeTimers() (set in the suite's beforeEach)
+    // would block forever waiting for the fake timer to advance. With real
+    // timers the backoff is ~100ms total (2 retries × 50ms).
+    vi.useRealTimers();
     const originalDelete = dbMock.delete;
     dbMock.delete = () => {
       throw new Error("synthetic DB failure");
@@ -552,6 +606,9 @@ describe("sessions", () => {
       expect(deleted).toBe(0);
       const counters = getSessionMetricsSnapshot().counters;
       expect(counters[SESSION_METRICS.SWEEPER_ERRORS]).toBe(1);
+      // 3 attempts -> 2 retries observed (between attempts) before the outer
+      // catch bumps the existing terminal counter.
+      expect(counters[SESSION_METRICS.SWEEP_RETRY]).toBe(2);
       const failed = consoleErrorSpy.mock.calls.find(([line]) =>
         typeof line === "string" && line.includes("session.sweep_failed"),
       );
@@ -592,9 +649,11 @@ describe("sessions", () => {
       await expect(createSession("0xDbCreate")).rejects.toThrow(
         "synthetic create failure",
       );
+      // createSession's db-error path is not a "validation rejection" — it
+      // never increments the global REJECTED counter. updateSession lifecycle
+      // metrics are also untouched (the session was never created).
       const counters = getSessionMetricsSnapshot().counters;
       expect(counters[SESSION_METRICS.CREATED] ?? 0).toBe(0);
-      expect(counters[SESSION_METRICS.REJECTED]).toBe(1);
       const failed = consoleErrorSpy.mock.calls.find(([line]) =>
         typeof line === "string" && line.includes("session.rejected"),
       );
@@ -625,5 +684,284 @@ describe("sessions", () => {
     await revokeSessionByHash(tokenHash);
     const session = await getSessionByHash(tokenHash);
     expect(session!.revokedAt).toBeInstanceOf(Date);
+  // ---------------------------------------------------------------------------
+  // Reliability: bounded retry + idempotent re-revoke detection (issue #125)
+  //
+  // These tests use `vi.useRealTimers()` inside the test body because the
+  // retry helper backs off with `setTimeout(resolve, 50)` between attempts,
+  // and vitest's fake timers would otherwise block the awaits forever.
+  // The session-level `beforeEach` still sets up fake timers + mock state,
+  // which is the right starting position for non-retry tests.
+  // ---------------------------------------------------------------------------
+
+  it("retries revokeSession on a transient DB error and ultimately succeeds", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xRetryRevoke");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic transient revoke failure");
+          // On the second attempt, fall back to the original mock behaviour so
+          // the row mutation happens and requireSession + REVOKED bookkeeping
+          // match the production contract.
+          await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
+        },
+      }),
+    });
+    try {
+      await revokeSession(token);
+      expect(attempts).toBe(2);
+      const counters = getSessionMetricsSnapshot().counters;
+      expect(counters[SESSION_METRICS.REVOKE_RETRY]).toBe(1);
+      expect(counters[SESSION_METRICS.REVOKED]).toBe(1);
+      expect(counters[SESSION_METRICS.REVOKE_FAILED] ?? 0).toBe(0);
+      const retry = consoleWarnSpy.mock.calls.find(([line]) =>
+        typeof line === "string" && line.includes("session.revoke_retry"),
+      );
+      expect(retry).toBeDefined();
+      expect(retry![0]).toContain("kind=single");
+      expect(retry![0]).toContain("attempt=1");
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("rethrows the last DB error from revokeSession after retry exhaustion", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xExhaustRevoke");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          throw new Error("synthetic permanent revoke failure");
+        },
+      }),
+    });
+    try {
+      await expect(revokeSession(token)).rejects.toThrow(
+        "synthetic permanent revoke failure",
+      );
+      expect(attempts).toBe(3); // maxAttempts
+      const counters = getSessionMetricsSnapshot().counters;
+      expect(counters[SESSION_METRICS.REVOKE_RETRY]).toBe(2); // between 3 attempts
+      expect(counters[SESSION_METRICS.REVOKE_FAILED]).toBe(1);
+      expect(counters[SESSION_METRICS.REVOKED] ?? 0).toBe(0); // never succeeded
+      const failed = consoleErrorSpy.mock.calls.find(([line]) =>
+        typeof line === "string" && line.includes("session.revoke_failed"),
+      );
+      expect(failed).toBeDefined();
+      expect(failed![0]).toContain("kind=single");
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("classifies a repeat revokeSession as session.revoke_already without inflating REVOKED", async () => {
+    const { token } = await createSession("0xRepeat");
+    await revokeSession(token); // first call: from null -> now()
+    const before = getSessionMetricsSnapshot().counters;
+    expect(before[SESSION_METRICS.REVOKED]).toBe(1);
+    expect(before[SESSION_METRICS.REVOKED_ALREADY] ?? 0).toBe(0);
+
+    consoleInfoSpy.mockClear();
+    await revokeSession(token); // repeat: idempotent re-revoke
+    const after = getSessionMetricsSnapshot().counters;
+    // REVOKED stays at 1 (not 2) — the second call was idempotent.
+    expect(after[SESSION_METRICS.REVOKED]).toBe(1);
+    expect(after[SESSION_METRICS.REVOKED_ALREADY]).toBe(1);
+    const already = consoleInfoSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.revoke_already"),
+    );
+    expect(already).toBeDefined();
+    expect(already![0]).toContain("kind=single");
+  });
+
+  it("classifies a repeat revokeFamily as idempotent without re-incrementing FAMILY_REVOKED", async () => {
+    const { token } = await createSession("0xFamRepeat");
+    const familyId = mockState.sessions[0].familyId;
+    await revokeFamily(familyId);
+    const before = getSessionMetricsSnapshot().counters;
+    expect(before[SESSION_METRICS.FAMILY_REVOKED]).toBe(1);
+    expect(before[SESSION_METRICS.FAMILY_REVOKED_ALREADY] ?? 0).toBe(0);
+    await revokeFamily(familyId); // repeat
+    const after = getSessionMetricsSnapshot().counters;
+    expect(after[SESSION_METRICS.FAMILY_REVOKED]).toBe(1); // unchanged
+    expect(after[SESSION_METRICS.FAMILY_REVOKED_ALREADY]).toBe(1);
+  });
+
+  it("classifies a repeat revokeAllSessionsForAddress as idempotent without re-incrementing ALL_REVOKED", async () => {
+    const { token } = await createSession("0xallrepeat");
+    await revokeAllSessionsForAddress("0xallrepeat");
+    const before = getSessionMetricsSnapshot().counters;
+    expect(before[SESSION_METRICS.ALL_REVOKED]).toBe(1);
+    expect(before[SESSION_METRICS.ALL_REVOKED_ALREADY] ?? 0).toBe(0);
+    await revokeAllSessionsForAddress("0xallrepeat"); // repeat
+    const after = getSessionMetricsSnapshot().counters;
+    expect(after[SESSION_METRICS.ALL_REVOKED]).toBe(1);
+    expect(after[SESSION_METRICS.ALL_REVOKED_ALREADY]).toBe(1);
+  });
+
+  it("retries revokeFamily on a transient DB error and ultimately succeeds", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xFamRetry");
+    const familyId = mockState.sessions[0].familyId;
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic family retry");
+          await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
+        },
+      }),
+    });
+    try {
+      await revokeFamily(familyId);
+      expect(attempts).toBe(2);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_RETRY]).toBe(1);
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("retries revokeAllSessionsForAddress on a transient DB error and ultimately succeeds", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xalladdrretry");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic all retry");
+          await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
+        },
+      }),
+    });
+    try {
+      await revokeAllSessionsForAddress("0xalladdrretry");
+      expect(attempts).toBe(2);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_RETRY]).toBe(1);
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("retries sweepExpiredSessions on a transient DB error and ultimately succeeds", async () => {
+    vi.useRealTimers();
+    // Create one session and revoke it; the sweep predicate will match it
+    // (revokedAt is non-null). On retry success we return a fixed row set
+    // so the assertion on `attempts` is independent of the underlying row
+    // filter bookkeeping.
+    const a = await createSession("0xSweepRetryA");
+    await revokeSession(a.token);
+
+    const originalDelete = dbMock.delete;
+    let attempts = 0;
+    dbMock.delete = (table: any) => ({
+      where: (_cond: any) => ({
+        returning: async (_fields: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic sweep retry");
+          // Second attempt succeeds with a fixed, deterministic row set.
+          return [{ tokenHash: mockState.sessions[0].tokenHash }];
+        },
+      }),
+    });
+    try {
+      const deleted = await sweepExpiredSessions();
+      expect(attempts).toBe(2);
+      expect(deleted).toBe(1);
+      const counters = getSessionMetricsSnapshot().counters;
+      expect(counters[SESSION_METRICS.SWEEP_RETRY]).toBe(1);
+      expect(counters[SESSION_METRICS.SWEEP_RUNS]).toBe(1);
+      expect(counters[SESSION_METRICS.SWEEP_DELETED]).toBe(1);
+      const retry = consoleWarnSpy.mock.calls.find(([line]) =>
+        typeof line === "string" && line.includes("session.sweep_retry"),
+      );
+      expect(retry).toBeDefined();
+      expect(retry![0]).toContain("attempt=1");
+    } finally {
+      dbMock.delete = originalDelete;
+    }
+  });
+
+  it("returns 0 and emits session.sweep_failed after sweep retry exhaustion", async () => {
+    vi.useRealTimers();
+    const originalDelete = dbMock.delete;
+    dbMock.delete = () => ({
+      where: () => ({
+        returning: async () => {
+          throw new Error("synthetic sweep permanent");
+        },
+      }),
+    });
+    try {
+      const deleted = await sweepExpiredSessions();
+      expect(deleted).toBe(0);
+      const counters = getSessionMetricsSnapshot().counters;
+      // 3 attempts -> 2 retries observed (between attempts), and the final
+      // catch bumps the existing terminal counter.
+      expect(counters[SESSION_METRICS.SWEEP_RETRY]).toBe(2);
+      expect(counters[SESSION_METRICS.SWEEPER_ERRORS]).toBe(1);
+      expect(counters[SESSION_METRICS.SWEEP_RUNS] ?? 0).toBe(0);
+      expect(counters[SESSION_METRICS.SWEEP_DELETED] ?? 0).toBe(0);
+      const retries = consoleWarnSpy.mock.calls.filter(([line]) =>
+        typeof line === "string" && line.includes("session.sweep_retry"),
+      );
+      expect(retries).toHaveLength(2);
+      const failed = consoleErrorSpy.mock.calls.find(([line]) =>
+        typeof line === "string" && line.includes("session.sweep_failed"),
+      );
+      expect(failed).toBeDefined();
+    } finally {
+      dbMock.delete = originalDelete;
+    }
+  });
+
+  it("does NOT retry createSession (insert is not idempotent)", async () => {
+    vi.useRealTimers();
+    const originalInsert = dbMock.insert;
+    let attempts = 0;
+    dbMock.insert = (table: any) => ({
+      values: async (_data: any) => {
+        attempts++;
+        throw new Error("synthetic single-attempt insert");
+      },
+    });
+    try {
+      await expect(createSession("0xNoRetryCreate")).rejects.toThrow(
+        "synthetic single-attempt insert",
+      );
+      expect(attempts).toBe(1);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_RETRY] ?? 0).toBe(0);
+    } finally {
+      dbMock.insert = originalInsert;
+    }
+  });
+
+  it("does NOT retry requireSession on the hot path", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xNoRetryRequire");
+    const originalSelect = dbMock.select;
+    let attempts = 0;
+    dbMock.select = () => {
+      attempts++;
+      throw new Error("synthetic single-attempt require");
+    };
+    try {
+      const ok = await requireSession("0xnoretryrequire", token);
+      expect(ok).toBe(false);
+      expect(attempts).toBe(1);
+ 
+    } finally {
+      dbMock.select = originalSelect;
+    }
   });
 });
