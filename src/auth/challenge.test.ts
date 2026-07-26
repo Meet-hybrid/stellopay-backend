@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { shortString } from "starknet";
 import {
   buildTypedChallenge,
@@ -21,6 +21,10 @@ const chainIdMain = shortString.encodeShortString("SN_MAIN");
 const ADDR_HEX_UPPER = "0xAABB"; // "0xaabb" after normalize
 const ADDR_HEX_FULL = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 const ADDR_HEX_SHORT = "0xfeed";
+
+// ---------------------------------------------------------------------------
+// Existing contract tests — must stay green to preserve caller compatibility
+// ---------------------------------------------------------------------------
 
 describe("buildTypedChallenge", () => {
   it("decodes the chainId felt back into its label", () => {
@@ -74,9 +78,11 @@ describe("buildTypedChallenge", () => {
   });
 });
 
-describe("challenge management & telemetry", () => {
-  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+// ---------------------------------------------------------------------------
+// getChainIdLabel — caching behaviour
+// ---------------------------------------------------------------------------
 
+describe("getChainIdLabel", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

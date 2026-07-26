@@ -1,10 +1,24 @@
-import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
-export type ChallengeRecord = {
-  nonce: string;
-  expiresAtMs: number;
+// ---------------------------------------------------------------------------
+// SNIP-12 type definitions — constant across all challenges.
+// Declared once at module level so they are never re-created per-request.
+// ---------------------------------------------------------------------------
+
+const CHALLENGE_TYPES: TypedData["types"] = {
+  StarknetDomain: [
+    { name: "name", type: "felt" },
+    { name: "version", type: "felt" },
+    { name: "chainId", type: "felt" },
+    // SNIP-12 domain revision (some wallets, e.g. Ready, require it)
+    { name: "revision", type: "felt" },
+  ],
+  Challenge: [
+    { name: "action", type: "felt" },
+    { name: "wallet", type: "felt" },
+    { name: "nonce", type: "felt" },
+  ],
 };
 
 /**
@@ -42,7 +56,7 @@ export const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 export const MAX_CHALLENGES = 100_000;
 
 /**
- * Challenges are short-lived (5-minute TTL), cryptographic nonces used to prove wallet ownership.
+ * Memoised mapping from encoded chain-ID felt → human-readable label.
  *
  * RATIONALE FOR IN-MEMORY RETENTION:
  * Challenges are highly transient. Storing them in-memory avoids unnecessary DB read/write overhead
@@ -55,7 +69,7 @@ export const MAX_CHALLENGES = 100_000;
  * refuses to store a new entry and throws so the route layer can surface
  * the failure rather than silently dropping a security-relevant signal.
  */
-export const challenges = new Map<string, ChallengeRecord>();
+const chainIdCache = new Map<string, string>();
 
 /**
  * Number of `createChallenge` calls between opportunistic sweeps of expired entries.
@@ -159,9 +173,10 @@ export function getChallenge(address: string) {
 }
 
 /**
- * Clears a challenge once verified.
+ * Clear the chain-ID decode cache.
  *
- * @param address - The user's Starknet wallet address
+ * Only intended for use in tests that need to verify the caching behaviour
+ * or that construct unusual chainId values. Production code must not call this.
  */
 export function clearChallenge(address: string) {
   const lookupKey = normalizeAddressKey(address);
@@ -232,25 +247,12 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
   // (starknet.js will encode these according to the declared `felt` types when hashing/verifying)
   const chainIdLabel = shortString.decodeShortString(chainId);
   return {
-    types: {
-      StarknetDomain: [
-        { name: "name", type: "felt" },
-        { name: "version", type: "felt" },
-        { name: "chainId", type: "felt" },
-        // SNIP-12 domain revision (some wallets, e.g. Ready, require it)
-        { name: "revision", type: "felt" },
-      ],
-      Challenge: [
-        { name: "action", type: "felt" },
-        { name: "wallet", type: "felt" },
-        { name: "nonce", type: "felt" },
-      ],
-    },
+    types: CHALLENGE_TYPES,
     primaryType: "Challenge",
     domain: {
       name: "StelloPay",
       version: "1",
-      chainId: chainIdLabel,
+      chainId: getChainIdLabel(chainId),
       revision: "1",
     },
     message: {
