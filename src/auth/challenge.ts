@@ -20,15 +20,45 @@ const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 export const challenges = new Map<string, ChallengeRecord>();
 
 /**
+ * Number of `createChallenge` calls between opportunistic sweeps of expired entries.
+ *
+ * `getChallenge`/`consumeChallenge` only evict an entry when it is *read*, so an
+ * address that requests a challenge and never follows up with `/auth/verify`
+ * (an abandoned login, or an attacker enumerating addresses) would otherwise sit
+ * in `challenges` forever, growing the map without bound. Sweeping periodically
+ * on the write path bounds that growth without needing a background timer,
+ * which would complicate shutdown and test lifecycles.
+ */
+const SWEEP_INTERVAL = 50;
+let creationsSinceSweep = 0;
+
+/** Removes all entries whose TTL has already elapsed as of `now`. */
+function sweepExpiredChallenges(now: number): void {
+  for (const [key, rec] of challenges) {
+    if (now > rec.expiresAtMs) {
+      challenges.delete(key);
+    }
+  }
+}
+
+/**
  * Generates a challenge nonce for verification.
  *
  * @param address - The user's Starknet wallet address
  * @returns The generated nonce and its TTL
  */
 export function createChallenge(address: string) {
+  const now = Date.now();
+
+  creationsSinceSweep += 1;
+  if (creationsSinceSweep >= SWEEP_INTERVAL) {
+    creationsSinceSweep = 0;
+    sweepExpiredChallenges(now);
+  }
+
   const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
-  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: Date.now() + CHALLENGE_TTL_MS });
-  
+  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: now + CHALLENGE_TTL_MS });
+
   // Structured log/metric for challenge generation
   console.info(JSON.stringify({
     metric: "challenge_created",
