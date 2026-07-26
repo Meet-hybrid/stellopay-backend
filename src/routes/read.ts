@@ -24,6 +24,24 @@ async function callContractResult(
   return Array.isArray(out) ? out : (out as any)?.result;
 }
 
+// -------- contracts / schemas --------
+
+export const CursorPaginationSchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+export const BatchReadSchema = z.object({
+  ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
+});
+
+export interface PaginatedReadResponse<T> {
+  data: T[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limit: number;
+}
+
 async function erc20BalanceOf(token: string, owner: string) {
   // Minimal ERC20 balance read (Cairo ERC20s typically expose `balance_of(address) -> u256`)
   const result = await callContractResult(token, "balance_of", [owner]);
