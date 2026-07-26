@@ -29,10 +29,9 @@ import { redactRecentEvent, fetchDiagnosticsData, diagnosticsRouter } from "./di
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 
-// Use valid-hex addresses: the auth middleware now compares the principal
-// against the admin allowlist through normalizeStarknetAddress, which
-// rejects anything outside [0-9a-f]. The previous "0xadmin"/"0xnotadmin"
-// placeholders contained `m`, `n`, `o`, `t` and so they would always 403.
+// Use valid-hex addresses: the auth middleware now compares the
+// principal against the admin allowlist through normalizeStarknetAddress,
+// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
 

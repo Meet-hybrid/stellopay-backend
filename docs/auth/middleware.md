@@ -13,8 +13,8 @@ truth and the implementation needs fixing.
 
 `requireAuth` and `requireAdmin` are the only two authorized sources of
 `req.auth`. Centralizing them in a single module prevents privilege checks
-from drifting as new routers are added, and gives the test suite one place
-to exercise the boundary instead of N places.
+from drifting as new routers are added, and gives the test suite one place to
+exercise the boundary instead of N places.
 
 ## Principal resolution — `requireAuth`
 
@@ -52,8 +52,9 @@ response cannot be used to probe header validity.
 - `req.auth.token` is the trimmed bearer token. Routes that need to revoke
   the underlying session feed it to `revokeSession` from `auth/session.ts`,
   which hashes it before the DB query.
-- `next()` is called **outside** the try/catch. A synchronous throw in a
-  downstream route must surface as a 5xx, never become a misleading 401.
+- `next()` is called **after** the try/catch — a throw in a downstream
+  route must be caught by Express and surfaced as a 5xx, never silently
+  relabeled as a 401.
 
 ## Route authorization — `requireAdmin`
 
@@ -64,9 +65,9 @@ response cannot be used to probe header validity.
 **Canonical comparison.** Both the principal address and every allowlist
 entry are passed through `normalizeStarknetAddress` (which pads to 64 hex
 characters, strips redundant leading zeros, verifies a mixed-case
-checksum, and rejects malformed values) before the comparison. As a
-result `0x1`, `0x000…001`, and a valid mixed-case checksum for the same
-address all resolve to one canonical string.
+checksum, and rejects malformed values) before the comparison. As a result
+`0x1`, `0x000…001`, and a valid mixed-case checksum for the same address all
+resolve to one canonical string.
 
 **Failure modes** — each with a distinct HTTP status:
 
@@ -75,14 +76,14 @@ address all resolve to one canonical string.
 | `req.auth` missing or `req.auth.address` is empty string |  `401` | `{ error: "Unauthorized" }` |
 | Principal present, but cannot be parsed as an address    |  `403` | `{ error: "Forbidden" }`    |
 | Parsed canonical ≠ every parsed allowlist entry          |  `403` | `{ error: "Forbidden" }`    |
-| A malformed entry in `ADMIN_ADDRESSES` is silently       |  `403` | `{ error: "Forbidden" }`    |
+| Malformed entry in `ADMIN_ADDRESSES` is silently         |  `403` | `{ error: "Forbidden" }`    |
 | skipped (never matched, never crashed).                  |        |                             |
 | Principal matches the allowlist                          | (next) | (route handler response)    |
 
-The 401/403 split is deliberate: callers must be able to tell "you are
-not signed in" apart from "you are signed in but not allowed for this
-route". Collapsing them into a single 401 (the previous behaviour) made
-clients retry credentials forever on the second case.
+The `401`/`403` split is deliberate: callers must be able to tell "you are
+not signed in" apart from "you are signed in but not allowed". Collapsing
+them into a single 401 (the previous behaviour) made clients retry
+credentials forever on the second case.
 
 **Success path** — calls `next()` and lets the route handle the request.
 
@@ -102,9 +103,9 @@ asserts `req.auth` is present, so it MUST run after `requireAuth`.
 
 `src/auth/middleware.test.ts` covers the full contract:
 
-- `requireAuth` failure paths (missing header, non-string header,
-  non-Bearer, empty token, empty address, invalid session, throwing
-  session lookup).
+- `requireAuth` failure paths (missing header, non-string array header,
+  non-Bearer, empty trimmed token, empty trimmed address, invalid session,
+  throwing session lookup).
 - `requireAuth` success path (lowercased address stored, raw token
   stored, next called).
 - `requireAdmin` 401 path (missing `req.auth`, empty address).
@@ -121,9 +122,8 @@ the real middlewares and a mocked session, so changing the
 
 The following are explicitly NOT part of this contract:
 
-- Adding roles beyond `admin` (a third "operator" tier, RBAC, etc.).
-- Per-route permission policies, attributes, or scoped authorization.
-- Customizing the 401/403 body shape (e.g. linking the wallet challenge).
-- Rate-limiting on the principal itself — see `middleware/rate-limit.ts`.
-- Session creation, refresh, and rotation — see `auth/session.ts` and
-  `routes/auth.ts`.
+- Adding a third role beyond `admin`.
+- Theming the unauthorized response (e.g. Web3 wallet prompts).
+- Rate-limiting on the principal itself (see `middleware/rate-limit.ts`).
+- Session creation, which lives in `auth/session.ts`.
+- Token refresh/rotation, which lives in `routes/auth.ts`.

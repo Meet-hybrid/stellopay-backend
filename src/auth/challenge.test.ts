@@ -126,4 +126,70 @@ describe("challenge management & telemetry", () => {
     expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_consumed"'));
     expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_miss"'));
   });
+
+  // -------------------------------------------------------------------------
+  // Expired-challenge sweep (bounds unbounded memory growth)
+  //
+  // getChallenge/consumeChallenge only evict an entry when it is *read*. An
+  // address that requests a challenge and never calls /auth/verify (an
+  // abandoned login, or an attacker enumerating addresses) would otherwise
+  // never be cleaned up. Each test below imports a fresh module instance via
+  // vi.resetModules() so its own sweep counter is isolated from the shared
+  // top-level imports used elsewhere in this file.
+  // -------------------------------------------------------------------------
+
+  it("success path: does not evict a still-valid challenge even once the sweep interval is crossed", async () => {
+    vi.resetModules();
+    const mod = await import("./challenge");
+
+    mod.createChallenge("0xstillvalid");
+    // Cross the sweep interval with unrelated traffic.
+    for (let i = 0; i < 50; i++) {
+      mod.createChallenge(`0xfiller${i}`);
+    }
+
+    expect(mod.challenges.has("0xstillvalid")).toBe(true);
+    expect(mod.getChallenge("0xstillvalid")).not.toBeNull();
+
+    vi.resetModules();
+  });
+
+  it("boundary path: proactively evicts an expired challenge that was never read, once enough new challenges are created", async () => {
+    vi.resetModules();
+    const mod = await import("./challenge");
+
+    mod.createChallenge("0xabandoned");
+    expect(mod.challenges.has("0xabandoned")).toBe(true);
+
+    // Let it expire without ever calling getChallenge/consumeChallenge on it —
+    // lazy eviction-on-read never fires for this entry.
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+
+    // Cross the sweep interval with unrelated traffic (none of it touching
+    // "0xabandoned").
+    for (let i = 0; i < 50; i++) {
+      mod.createChallenge(`0xfiller${i}`);
+    }
+
+    expect(mod.challenges.has("0xabandoned")).toBe(false);
+
+    vi.resetModules();
+  });
+
+  it("boundary path: the sweep leaves not-yet-expired entries in place, only removing ones past their TTL", async () => {
+    vi.resetModules();
+    const mod = await import("./challenge");
+
+    mod.createChallenge("0xexpiring");
+    // Advance partway through the TTL — not expired yet.
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS - 1);
+
+    for (let i = 0; i < 50; i++) {
+      mod.createChallenge(`0xfiller${i}`);
+    }
+
+    expect(mod.challenges.has("0xexpiring")).toBe(true);
+
+    vi.resetModules();
+  });
 });
