@@ -591,4 +591,222 @@ describe("Auth Routes Integration", () => {
     expect(revokeByAdmin.status).toBe(200);
     expect(revokeByAdmin.body.ok).toBe(true);
   });
+
+  // -----------------------------------------------------------------------
+  // Idempotency contract (#195): login, challenge, and session issuance must
+  // be safe to retry without producing ambiguous outcomes.
+  // -----------------------------------------------------------------------
+  describe("/auth/challenge idempotency", () => {
+    it("returns the same nonce when retried within the active TTL window", async () => {
+      const address = "0xChallengeRetry";
+      const appInstance = makeApp();
+
+      const first = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      expect(first.status).toBe(200);
+
+      const second = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+
+      expect(second.status).toBe(200);
+      expect(second.body.nonce).toBe(first.body.nonce);
+      expect(second.body.chain_id).toBe(first.body.chain_id);
+      // TTL is anchored to the original issuance — no refresh on retry.
+      expect(second.body.expires_in_ms).toBe(first.body.expires_in_ms);
+      // Same nonce means the typed-data payload is also byte-equal.
+      expect(second.body.typed_data).toEqual(first.body.typed_data);
+    });
+
+    it("issues a fresh nonce after the original challenge has expired", async () => {
+      const address = "0xChallengeExpiredRetry";
+      const appInstance = makeApp();
+
+      const first = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      expect(first.status).toBe(200);
+
+      vi.advanceTimersByTime(first.body.expires_in_ms + 1);
+
+      const second = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      expect(second.status).toBe(200);
+      expect(second.body.nonce).not.toBe(first.body.nonce);
+      // Fresh TTL: a brand-new 5-minute window.
+      expect(second.body.expires_in_ms).toBe(300000);
+    });
+
+    it("treats mixed-case address retries as the same challenge", async () => {
+      const appInstance = makeApp();
+
+      const first = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address: "0xMixedCase" });
+      const second = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address: "0xMIXEDCASE" });
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(second.body.nonce).toBe(first.body.nonce);
+    });
+
+    it("a retry after the challenge was consumed returns a brand-new nonce (consume is terminal)", async () => {
+      const address = "0xChallengeConsumedThenRetried";
+      const appInstance = makeApp();
+
+      const first = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+      const verify = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] });
+      expect(verify.status).toBe(200);
+
+      const retry = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      expect(retry.status).toBe(200);
+      expect(retry.body.nonce).not.toBe(first.body.nonce);
+    });
+  });
+
+  describe("session issuance idempotency (verify + refresh)", () => {
+    it("two /auth/verify calls cannot both create a session off the same challenge", async () => {
+      const address = "0xNoDoubleSession";
+      const appInstance = makeApp();
+
+      await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+
+      const [a, b] = await Promise.all([
+        request(appInstance)
+          .post("/api/v1/auth/verify")
+          .send({ address, signature: ["0xsig1", "0xsig2"] }),
+        request(appInstance)
+          .post("/api/v1/auth/verify")
+          .send({ address, signature: ["0xsig1", "0xsig2"] }),
+      ]);
+
+      const okCount = [a, b].filter((r) => r.status === 200).length;
+      const failCount = [a, b].filter((r) => r.status === 400).length;
+      expect(okCount).toBe(1);
+      expect(failCount).toBe(1);
+      expect(mockState.sessions).toHaveLength(1);
+    });
+
+    it("/auth/session/validate is read-only and trivially idempotent on retry", async () => {
+      const address = "0xValidateRetry";
+      const appInstance = makeApp();
+
+      await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+      const verify = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] });
+      const token = verify.body.session_token;
+
+      const r1 = await request(appInstance)
+        .post("/api/v1/auth/session/validate")
+        .send({ address, session_token: token });
+      const r2 = await request(appInstance)
+        .post("/api/v1/auth/session/validate")
+        .send({ address, session_token: token });
+      const r3 = await request(appInstance)
+        .post("/api/v1/auth/session/validate")
+        .send({ address, session_token: token });
+
+      for (const r of [r1, r2, r3]) {
+        expect(r.status).toBe(200);
+        expect(r.body.ok).toBe(true);
+        expect(r.body.address).toBe(address);
+      }
+      // validate does not consume the session — still exactly one row.
+      expect(mockState.sessions).toHaveLength(1);
+    });
+
+    it("/auth/refresh is deterministic per input token (replay of a rotated token fails closed)", async () => {
+      const address = "0xRefreshDeterministic";
+      const appInstance = makeApp();
+
+      await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+      const verify = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] });
+      const firstToken = verify.body.session_token;
+
+      const r1 = await request(appInstance)
+        .post("/api/v1/auth/refresh")
+        .send({ address, refresh_token: firstToken });
+      expect(r1.status).toBe(200);
+      const secondToken = r1.body.refresh_token;
+
+      // Replaying the stale first token deterministically fails (it was rotated).
+      const replay = await request(appInstance)
+        .post("/api/v1/auth/refresh")
+        .send({ address, refresh_token: firstToken });
+      expect(replay.status).toBe(401);
+    });
+  });
+
+  describe("logout / revoke idempotency (already-revoked → 401, not an error)", () => {
+    it("/auth/logout is idempotent for a still-valid session, and rejects a session that was already revoked", async () => {
+      const address = "0xLogoutRetry";
+      const appInstance = makeApp();
+
+      await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+      const verify = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] });
+      const token = verify.body.session_token;
+
+      // First logout: ok.
+      const first = await request(appInstance)
+        .post("/api/v1/auth/logout")
+        .set("x-user-address", address)
+        .set("Authorization", `Bearer ${token}`);
+      expect(first.status).toBe(200);
+
+      // Second logout on the now-revoked session: 401, same generic envelope.
+      // We deliberately do NOT return 200 here so that probes cannot distinguish
+      // "session was already revoked" from "session never existed".
+      const second = await request(appInstance)
+        .post("/api/v1/auth/logout")
+        .set("x-user-address", address)
+        .set("Authorization", `Bearer ${token}`);
+      expect(second.status).toBe(401);
+      expect(second.body.error).toBe("Unauthorized");
+    });
+
+    it("/auth/revoke rejects a session that was already revoked", async () => {
+      const address = "0xRevokeRetry";
+      const appInstance = makeApp();
+
+      await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+      mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+      const verify = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] });
+      const token = verify.body.session_token;
+
+      const first = await request(appInstance)
+        .post("/api/v1/auth/revoke")
+        .set("x-user-address", address)
+        .set("Authorization", `Bearer ${token}`);
+      expect(first.status).toBe(200);
+
+      const second = await request(appInstance)
+        .post("/api/v1/auth/revoke")
+        .set("x-user-address", address)
+        .set("Authorization", `Bearer ${token}`);
+      expect(second.status).toBe(401);
+      expect(second.body.error).toBe("Unauthorized");
+    });
+  });
 });

@@ -12,7 +12,9 @@ import {
 } from "./challenge";
 
 // SN_SEPOLIA encoded as a felt short string, as the RPC provider returns it.
-const chainId = shortString.encodeShortString("SN_SEPOLIA");
+const chainIdSepolia = shortString.encodeShortString("SN_SEPOLIA");
+// SN_MAIN encoded as a felt short string, exercising the alternate chain.
+const chainIdMain = shortString.encodeShortString("SN_MAIN");
 
 // A few valid Starknet addresses used as test inputs. Hex-only — these are
 // the canonical normalized form (lowercase, 64 hex chars).
@@ -22,8 +24,13 @@ const ADDR_HEX_SHORT = "0xfeed";
 
 describe("buildTypedChallenge", () => {
   it("decodes the chainId felt back into its label", () => {
-    const td = buildTypedChallenge("0x123", chainId, "0xnonce");
+    const td = buildTypedChallenge("0x123", chainIdSepolia, "0xnonce");
     expect((td.domain as Record<string, unknown>).chainId).toBe("SN_SEPOLIA");
+  });
+
+  it("decodes the mainnet chainId felt back into its label", () => {
+    const td = buildTypedChallenge("0x123", chainIdMain, "0xnonce");
+    expect((td.domain as Record<string, unknown>).chainId).toBe("SN_MAIN");
   });
 
   it("uses Challenge as the primaryType and embeds wallet, nonce and action", () => {
@@ -40,7 +47,7 @@ describe("buildTypedChallenge", () => {
   });
 
   it("declares the SNIP-12 domain with name, version and revision", () => {
-    const td = buildTypedChallenge("0x1", chainId, "0x2");
+    const td = buildTypedChallenge("0x1", chainIdSepolia, "0x2");
     const domain = td.domain as Record<string, unknown>;
     expect(domain.name).toBe("StelloPay");
     expect(domain.version).toBe("1");
@@ -75,11 +82,13 @@ describe("challenge management & telemetry", () => {
     vi.setSystemTime(0);
     challenges.clear();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    clearChallengesForTesting();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     consoleInfoSpy.mockRestore();
+    clearChallengesForTesting();
   });
 
   it("issues an active challenge and logs creation", () => {
@@ -334,5 +343,109 @@ describe("challenge store size cap (DoS hardening)", () => {
     expect(mod.challenges.has("0xexpiring")).toBe(true);
 
     vi.resetModules();
+  });
+});
+
+describe("createChallenge idempotency (#318, #195)", () => {
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    clearChallengesForTesting();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    consoleInfoSpy.mockRestore();
+    clearChallengesForTesting();
+  });
+
+  it("returns the same nonce on a retry while the active window is still open", () => {
+    const first = createChallenge("0xretry");
+    consoleInfoSpy.mockClear();
+
+    const second = createChallenge("0xretry");
+
+    expect(second.nonce).toBe(first.nonce);
+    expect(second.expires_in_ms).toBe(first.expires_in_ms);
+    // No new entry was created — the Map size is unchanged.
+    expect(challenges.size).toBe(1);
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_replayed"'),
+    );
+    expect(consoleInfoSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_created"'),
+    );
+  });
+
+  it("returns a reduced expires_in_ms on replay after time has advanced (TTL is NOT pushed forward)", () => {
+    const first = createChallenge("0xnorefresh");
+    vi.advanceTimersByTime(30_000);
+    consoleInfoSpy.mockClear();
+
+    const second = createChallenge("0xnorefresh");
+
+    expect(second.nonce).toBe(first.nonce);
+    // TTL remaining = CHALLENGE_TTL_MS - 30_000, never CHALLENGE_TTL_MS again.
+    expect(second.expires_in_ms).toBe(CHALLENGE_TTL_MS - 30_000);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_replayed"'),
+    );
+  });
+
+  it("issues a fresh nonce after the prior challenge has expired (lazy-evict then create)", () => {
+    const first = createChallenge("0xrotated");
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+
+    consoleInfoSpy.mockClear();
+    const second = createChallenge("0xrotated");
+
+    expect(second.nonce).not.toBe(first.nonce);
+    expect(second.expires_in_ms).toBe(CHALLENGE_TTL_MS);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_created"'),
+    );
+    expect(consoleInfoSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_replayed"'),
+    );
+  });
+
+  it("collapses mixed-case address retries onto a single Map entry", () => {
+    const first = createChallenge("0xMixedCase");
+    const second = createChallenge("0xMIXEDCASE");
+    const third = createChallenge("0xmixedcase");
+
+    expect(second.nonce).toBe(first.nonce);
+    expect(third.nonce).toBe(first.nonce);
+    expect(challenges.size).toBe(1);
+    expect(challenges.has("0xmixedcase")).toBe(true);
+  });
+
+  it("treats different addresses as distinct challenges (replay isolation)", () => {
+    const a = createChallenge("0xAlice");
+    const b = createChallenge("0xBob");
+
+    expect(a.nonce).not.toBe(b.nonce);
+    expect(challenges.size).toBe(2);
+    // Alice's active challenge is unaffected by Bob's create/clear cycle.
+    clearChallenge("0xBob");
+    expect(getChallenge("0xAlice")?.nonce).toBe(a.nonce);
+  });
+
+  it("a successful consume makes the slot reusable (next createChallenge issues a fresh nonce)", () => {
+    const first = createChallenge("0xconsumed-then-reissued");
+    consumeChallenge("0xconsumed-then-reissued");
+    consoleInfoSpy.mockClear();
+
+    const second = createChallenge("0xconsumed-then-reissued");
+
+    expect(second.nonce).not.toBe(first.nonce);
+    expect(second.expires_in_ms).toBe(CHALLENGE_TTL_MS);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringContaining('"metric":"challenge_created"'),
+    );
   });
 });

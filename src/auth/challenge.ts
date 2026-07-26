@@ -227,7 +227,7 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
   // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
   // They expect plain string values like:
   // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"
-  // - domain.name/version: plain strings
+  // - domain.name/version: plain string
   // - message.action: plain string
   // (starknet.js will encode these according to the declared `felt` types when hashing/verifying)
   const chainIdLabel = shortString.decodeShortString(chainId);
