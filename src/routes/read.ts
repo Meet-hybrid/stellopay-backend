@@ -69,8 +69,47 @@ async function callContractResult(
   return Array.isArray(out) ? out : (out as any)?.result;
 }
 
-async function erc20BalanceOf(token: string, owner: string, requestId?: string) {
-  const start = process.hrtime.bigint();
+// -------- contracts / schemas --------
+
+export const CursorPaginationSchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+export const BatchReadSchema = z.object({
+  ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
+});
+
+export interface PaginatedReadResponse<T> {
+  data: T[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limit: number;
+}
+
+async function erc20BalanceOf(token: string, owner: string) {
+  // Minimal ERC20 balance read (Cairo ERC20s typically expose `balance_of(address) -> u256`)
+  const result = await callContractResult(token, "balance_of", [owner]);
+  const u256 = asU256FromResult(result);
+  if (!u256) {
+    throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
+  }
+  return u256ToString(u256);
+}
+
+async function erc20Decimals(token: string) {
+  const result = await callContractResult(token, "decimals", []);
+  if (!Array.isArray(result) || result.length < 1) {
+    throw new Error(`Unexpected decimals result: ${JSON.stringify(result)}`);
+  }
+  return Number(BigInt(result[0]));
+}
+
+async function erc20Symbol(token: string) {
+  const result = await callContractResult(token, "symbol", []);
+  if (!Array.isArray(result) || result.length < 1) {
+    throw new Error(`Unexpected symbol result: ${JSON.stringify(result)}`);
+  }
   try {
     const result = await callContractResult(token, "balance_of", [owner]);
     const u256 = asU256FromResult(result);
