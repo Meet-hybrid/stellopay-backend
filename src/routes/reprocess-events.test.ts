@@ -174,6 +174,7 @@ describe("Reprocess Events Routes", () => {
       const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(404);
 
       expect(res.body).toEqual({
+        success: false,
         error: "Transaction not found",
       });
     });

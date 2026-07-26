@@ -10,6 +10,7 @@ import { shortString, Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
+import { notFoundResponse } from "./not-found.js";
 
 const AddressParam = z.string().min(3);
 
@@ -518,12 +519,12 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
  */
 eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
   try {
-    const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
+    const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
 
     const result = await processTxReceipt(tx_hash);
 
     if (result.status === "not_found") {
-      res.status(404).json({ error: "Transaction not found" });
+      notFoundResponse(res, "Transaction not found");
       return;
     }
 
@@ -539,6 +540,10 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
       tokenVerified: result.tokenVerified,
     });
   } catch (e) {
+    if (e instanceof z.ZodError) {
+      res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+      return;
+    }
     next(e);
   }
 });
@@ -546,8 +551,8 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
 /**
  * POST /events/process_batch
  *
- * Process multiple Starknet transactions in a single request.  Each tx hash is
- * decoded and persisted independently using the same logic as
+ * Process multiple Starknet transactions in a single request.  Each *unique*
+ * tx hash is decoded and persisted independently using the same logic as
  * `process_tx/:tx_hash` so the operation is fully idempotent – re-submitting
  * the same batch produces no duplicate rows.
  *
@@ -555,6 +560,16 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
  * - `tx_hashes` must be a non-empty array of valid Starknet tx hash strings.
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request to
  *   prevent unbounded RPC calls and DB writes.
+ *
+ * **Within-request deduplication**
+ * Hashes are normalised (see {@link normalizeTransactionHash}) and any hash
+ * that has already appeared earlier in the same `tx_hashes` array is *not*
+ * re-fetched or re-processed – the result from its first occurrence is reused.
+ * This avoids redundant RPC calls and keeps the response `summary` accurate
+ * when a batch contains repeated/duplicated deliveries of the same tx. The
+ * `results` array still has one entry per input hash, in the same order, so
+ * `results[i]` always corresponds to `tx_hashes[i]`. The count of duplicate
+ * occurrences is reported as `summary.duplicates`.
  *
  * **Response**
  * Returns a `results` array where each entry corresponds to one tx hash and
@@ -576,32 +591,53 @@ eventsRouter.post("/events/process_batch", requireAuth, async (req, res, next) =
       .parse(req.body);
 
     const results: TxProcessResult[] = [];
+    const resultsByNormalizedHash = new Map<string, TxProcessResult>();
+    let duplicates = 0;
 
     for (const txHash of tx_hashes) {
+      const normalized = normalizeTransactionHash(txHash);
+      const existing = resultsByNormalizedHash.get(normalized);
+
+      if (existing) {
+        duplicates++;
+        results.push(existing);
+        continue;
+      }
+
       try {
         const result = await processTxReceipt(txHash);
+        resultsByNormalizedHash.set(normalized, result);
         results.push(result);
       } catch (e: any) {
         // Per-tx errors are captured so they don't abort the rest of the batch
-        results.push({
+        const errorResult: TxProcessResult = {
           txHash,
           status: "error",
           eventsProcessed: 0,
           eventLabels: [],
           error: e?.message ?? String(e),
-        });
+        };
+        resultsByNormalizedHash.set(normalized, errorResult);
+        results.push(errorResult);
       }
     }
 
-    const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
+    // Stats are derived from the unique (deduplicated) results so a hash that
+    // was submitted more than once contributes to the summary exactly once –
+    // otherwise repeated deliveries of the same tx within a batch would look
+    // like independent units of work. `duplicates` accounts for the rest of
+    // `total`: total === processed + noEvents + notFound + errors + duplicates.
+    const uniqueResults = Array.from(resultsByNormalizedHash.values());
+    const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
     res.json({
       summary: {
         total: results.length,
-        processed: results.filter((r) => r.status === "processed").length,
-        noEvents: results.filter((r) => r.status === "no_events").length,
-        notFound: results.filter((r) => r.status === "not_found").length,
-        errors: results.filter((r) => r.status === "error").length,
+        processed: uniqueResults.filter((r) => r.status === "processed").length,
+        noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
+        notFound: uniqueResults.filter((r) => r.status === "not_found").length,
+        errors: uniqueResults.filter((r) => r.status === "error").length,
+        duplicates,
         totalEventsProcessed: totalProcessed,
       },
       results,

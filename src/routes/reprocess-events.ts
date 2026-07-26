@@ -7,12 +7,8 @@ import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import {
-  processTxReceipt,
-  TxHashSchema,
-  MAX_BATCH_SIZE,
-  normalizeTransactionHash,
-} from "./events.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -71,7 +67,7 @@ reprocessEventsRouter.post(
       const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -85,7 +81,7 @@ reprocessEventsRouter.post(
         return;
       }
       if (e.message === "Transaction not found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
       next(e);
@@ -188,7 +184,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
         return;
       }
       next(e);
@@ -387,7 +383,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);

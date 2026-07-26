@@ -80,10 +80,19 @@ conventions in this file mirror that middleware: JSON output when
    └──────────────────────────────────────┘
 ```
 
----
+#### Sliding Expiration Write-Throttling
+To minimize database write load during frequent API requests, `requireSession` implements write-throttling. The session's `lastSeen` and `expiresAt` timestamps are only updated in the database if the time elapsed since `lastSeen` is at least 1 minute (`60,000 ms`). Validations occurring within this 1-minute window return successfully without invoking write operations to the database.
+
+### Token Rotation
 
 ## Structured log events
 
+#### Concurrency & Transaction Safety
+Token rotation is executed within a database transaction using row-level locking (`FOR UPDATE` on the matched session). This guarantees that concurrent rotation requests do not result in race conditions, ensuring that compromise detection and family revocation behave deterministically.
+
+#### Compromise Detection (Family Revocation)
+
+---
 Every event is a single line. Format depends on `LOG_FORMAT`:
 
 | `LOG_FORMAT`     | Output shape (per line)                                            |
@@ -108,6 +117,10 @@ ascending verbosity: `error`, `warn`, `info`, `debug`.
 | `session.sweep_completed` | info  | `sweepExpiredSessions` (success)           | `deleted`, `now` (ISO timestamp)                                               |
 | `session.sweep_failed`    | error | `sweepExpiredSessions` (DB error)          | `message`                                                                      |
 | `session.sweeper_crashed` | error | background interval `.catch`               | `message`                                                                      |
+| `session.revoke_already`  | info  | `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` (idempotent re-revoke detected) | `kind` (`single` / `family` / `all`), `token_hash_prefix` (single only), `family_id` (family only), `address` (all only) |
+| `session.revoke_retry`    | warn  | `withBoundedRetry` (revoke-family path)    | `kind`, `attempt`, `max_attempts`, `message` + kind-specific fields           |
+| `session.revoke_failed`   | error | `withBoundedRetry` (revoke-family path, exhausted) | `kind`, `message` + kind-specific fields                                       |
+| `session.sweep_retry`     | warn  | `withBoundedRetry` (`sweepExpiredSessions`) | `attempt`, `max_attempts`, `message`                                          |
 
 ### `session.rejected` reasons
 
@@ -151,6 +164,12 @@ out of scope for this PR.
 | `session_sweep_runs_total`                    | `sweepExpiredSessions` (success)                |
 | `session_sweep_deleted_total`                 | `sweepExpiredSessions` (success), by `count`    |
 | `session_sweeper_errors_total`                | `sweepExpiredSessions` DB error OR background `.catch` |
+| `session_revoke_retry_total`                 | `withBoundedRetry` (revoke-family path, between attempts) |
+| `session_revoke_failed_total`                | `withBoundedRetry` (revoke-family path, exhausted)        |
+| `session_sweep_retry_total`                  | `withBoundedRetry` (`sweepExpiredSessions`, between attempts) |
+| `session_revoke_already_total`               | `revokeSession` (idempotent re-revoke detected) |
+| `session_family_revoke_already_total`        | `revokeFamily` (idempotent re-revoke detected)  |
+| `session_all_revoke_already_total`           | `revokeAllSessionsForAddress` (idempotent re-revoke detected) |
 
 | Gauge name                              | Set by                                   |
 | --------------------------------------- | ---------------------------------------- |
@@ -220,6 +239,15 @@ for examples.
   still distinguishes `revoked` vs `expired_sliding` in the log, but it
   does not bubble that distinction up to the caller — the public contract
   stays `boolean`.
+- **No batching of large sweeps.** `sweepExpiredSessions` runs as a single
+  `DELETE … RETURNING …` against the `sessions` table. At our row volume
+  this completes inside the 10-minute cadence; if it ever doesn't, the
+  right fix is probably a partitioned sweep or a separate index on
+  `expires_at` / `absolute_expires_at`, both of which are out of scope
+  for this PR.
+- **No cross-session sampling.** Reliability metrics live in-process, so
+  each backend replica has its own count of retries / already-revokes.
+  Routing through a TSDB / Prometheus exporter is intentionally deferred.
 
 ---
 
@@ -232,3 +260,116 @@ for examples.
 - The behaviour of `requireSession`, `revokeSession`, `rotateSession`,
   `revokeFamily`, `revokeAllSessionsForAddress`, and `sweepExpiredSessions`
   is identical to the prior version; this PR only adds side channels.
+
+---
+
+# Session Lifecycle Reliability
+
+This section describes the **reliability contract** introduced alongside
+the observability contract above. The goal is to make session persistence,
+expiration, and invalidation safely retryable on transient DB failure
+without changing what callers see on the happy path.
+
+For the structured event / counter names referenced below, see
+[Structured log events](#structured-log-events) and
+[Metric counters](#metric-counters) above.
+
+## When to read this
+
+- You are designing a new caller that performs bulk token revocation or
+  relies on the sweeper, and want to know how many transient blips it
+  absorbs before failing.
+- You are debugging an alert on `session_revoke_failed_total` or
+  `session_sweep_retry_total` and need to know whether the corresponding
+  event shows up in the logs.
+- You are adding a new session mutation (e.g. a "freeze" or "rename"
+  operation) and want to follow the same retry + idempotency pattern.
+
+## What we retry, and what we deliberately do not
+
+Wrapped in `withBoundedRetry` (3 attempts, 50ms backoff, see
+`src/auth/session-retry.ts`):
+
+| Operation                                       | Why retry is safe                                                          |
+| ----------------------------------------------- | -------------------------------------------------------------------------- |
+| `revokeSession` (UPDATE)                        | `SET revokedAt = now()` applied to the same row twice produces the same final state. |
+| `revokeFamily` (UPDATE)                         | Same as above; per-family write is idempotent.                             |
+| `revokeAllSessionsForAddress` (UPDATE)          | Same as above; per-address write is idempotent.                            |
+| `sweepExpiredSessions` (DELETE)                 | Predicate is on `expiresAt` / `revokedAt`; the second attempt simply deletes fewer rows. |
+
+Deliberately **NOT** wrapped (throws on first DB error):
+
+| Operation                                       | Why retry would be unsafe                                                  |
+| ----------------------------------------------- | -------------------------------------------------------------------------- |
+| `createSession` (INSERT)                        | A retry could leave a duplicate row; the in-memory `crypto.randomBytes` token is already returned to the caller, so a successful retry would issue a second token. |
+| `rotateSession` (INSERT + UPDATE)               | Mid-flight retry after a partial commit would either leave a duplicated row or orphan the original session. |
+| `requireSession` (SELECT + UPDATE)              | Verifying auth on the hot path; retrying would inflate p99 latency for every authenticated request and produce confusing duplicate `session.validated` events. The caller naturally retries the HTTP request. |
+
+The `isRetryable(error)` predicate treats anything other than
+`unique/constraint/permission` text in `error.message` as a candidate for
+retry. Deterministic constraint violations always surface immediately so
+the caller can react (e.g. surface a 4xx if appropriate).
+
+## Idempotent re-revoke classification
+
+Before the retry loop runs, every revoke-family function performs one
+`SELECT` to check whether the row's `revokedAt` is already non-null. If
+so, an **additional** `session.revoke_already` info log is emitted and an
+**additional** counter is bumped:
+
+| Function                         | "Already revoked" counter                       |
+| -------------------------------- | ----------------------------------------------- |
+| `revokeSession`                  | `session_revoke_already_total`                  |
+| `revokeFamily`                   | `session_family_revoke_already_total`           |
+| `revokeAllSessionsForAddress`    | `session_all_revoke_already_total`              |
+
+The pre-existing `session_revoked_total` / `session_family_revoked_total`
+/ `session_all_revoked_total` counters are **NOT** double-bumped on a
+repeat call. The goal is to keep dashboards stable when a chatty client
+or a slow retry path calls the same logout / family-revoke endpoint
+twice: `REVOKED_total` reflects "this is how many distinct revocation
+events happened" and `REVOKED_ALREADY_total` reflects "of those, how
+many were idempotent re-plays".
+
+## Retry events and counters
+
+| Event name               | Level | Bumped counter                    | Emitted by                                  |
+| ------------------------ | ----- | --------------------------------- | ------------------------------------------- |
+| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all`) |
+| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` |
+| `session.sweep_retry`    | warn  | `session_sweep_retry_total`       | `withBoundedRetry` between attempts in `sweepExpiredSessions` |
+| `session.revoke_already` | info  | `session_revoke_already_total` (family / all variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
+
+`session.revoke_failed` always rethrows the original error so the route
+handler can return a 5xx. The pre-existing `session.sweep_failed` path
+keeps running unchanged — it still returns `0` from the call side so the
+periodic sweeper stays self-healing on the next tick.
+
+## Compatibility with issue #124
+
+The new event names reuse `SessionEventName`'s bounded enum in
+`src/auth/session-metrics.ts`, so the JSON / line-based log shape is
+unchanged. The new counters appear in `SESSION_METRICS` with stable
+string names so dashboards can be migrated in lock-step. No public
+function signature changed. All existing tests pass without
+modification.
+
+## New reliability helper
+
+`src/auth/session-retry.ts` exposes:
+
+```ts
+withBoundedRetry<T>(
+  op: () => Promise<T>,
+  policy?: Partial<{
+    maxAttempts: number;     // default 3
+    delayMs: number;         // default 50
+    isRetryable: (e) => boolean;  // default: deterministic hints are non-retryable
+  }>,
+  onRetry?: (info: { attempt; maxAttempts; error; delayMs }) => void,
+): Promise<T>
+```
+
+It is small enough to be re-used by future session mutations (e.g. an
+upcoming "freeze session" / "rename family" feature) so the entire
+session module keeps one retry policy.
