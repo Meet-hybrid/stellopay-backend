@@ -9,6 +9,14 @@ import {
   numeric,
 } from "drizzle-orm/pg-core";
 
+/**
+ * Index convention (enforced by schema-consistency.test.ts):
+ * Every foreign-key-shaped column — camelCase *Id mapped to SQL *_id (e.g. agreementId,
+ * profileId, milestoneId) — must have a btree index declared in this file. Primary keys and
+ * non-relational identifiers (e.g. taxId) are excluded. Missing indexes hurt join and filter
+ * performance as tables grow.
+ */
+
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
   "agreements",
