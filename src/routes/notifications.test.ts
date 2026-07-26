@@ -81,7 +81,11 @@ vi.mock("drizzle-orm", () => ({
   inArray: vi.fn((column: unknown, values: unknown) => ({ type: "inArray", column, values })),
 }));
 
-import { notificationsRouter } from "./notifications.js";
+import {
+  notificationsRouter,
+  getDefaultNotificationPreferences,
+  calculateUnreadCount,
+} from "./notifications.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
 function makeApp() {
@@ -115,8 +119,25 @@ beforeEach(() => {
   queryState.limitCalls = [];
 });
 
+describe("notification preferences & unread count helpers", () => {
+  it("provides default notification preferences enabled for all categories", () => {
+    const prefs = getDefaultNotificationPreferences();
+    expect(prefs).toEqual({
+      payments: true,
+      agreements: true,
+      escrow: true,
+      disputes: true,
+    });
+  });
+
+  it("calculates unread count correctly from notification objects", () => {
+    const list = [{ read: false }, { read: true }, { read: false }];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+});
+
 describe("notifications route", () => {
-  it("validates and normalizes the address and returns sorted notifications", async () => {
+  it("validates and normalizes the address and returns sorted notifications with unreadCount", async () => {
     queryState.rows.payments = [
       {
         id: "payment-1",
@@ -151,6 +172,7 @@ describe("notifications route", () => {
     const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
 
     expect(res.body.total).toBe(3);
+    expect(res.body.unreadCount).toBe(3);
     expect(res.body.notifications).toHaveLength(3);
     expect(res.body.notifications.map((n: { id: string }) => n.id)).toEqual([
       "event-1",
@@ -160,6 +182,7 @@ describe("notifications route", () => {
     expect(queryState.limitCalls.every((limit) => limit === 10)).toBe(true);
     expect(queryState.eqValues).toContain(normalizeStarknetAddress("abc"));
   });
+
 
   it("maps every payment, agreement, and escrow event type to its notification title", async () => {
     queryState.rows.payments = [
