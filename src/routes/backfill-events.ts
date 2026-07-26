@@ -2,13 +2,54 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
 export const backfillEventsRouter = Router();
 
+// ---------------------------------------------------------------------------
+// Contract constants – exported so tests and docs reference the single source
+// of truth rather than duplicating magic numbers.
+// ---------------------------------------------------------------------------
+
 /** Maximum number of rows the backfill may scan per request. */
-const MAX_BACKFILL_LIMIT = 5000;
+export const MAX_BACKFILL_LIMIT = 5000;
+
+/** Default scan limit when the caller omits the `limit` query parameter. */
+export const DEFAULT_BACKFILL_LIMIT = 1000;
+
+/**
+ * Sentinel `eventIndex` value written for every synthetic backfill row.
+ * Real on-chain events always have `eventIndex >= 0`, so **-1** makes
+ * backfill rows trivially distinguishable.
+ */
+export const BACKFILL_EVENT_INDEX = -1;
+
+/** How many result objects the response preview (`results` array) may contain. */
+export const RESULTS_PREVIEW_SIZE = 10;
+
+// ---------------------------------------------------------------------------
+// Synthetic event-ID builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the deterministic, collision-safe event ID used for backfill rows.
+ *
+ * Format: `{transactionHash}_backfill_{eventType}_{rowId}`
+ *
+ * The `_backfill_` segment can never appear in real event IDs (which use
+ * `{txHash}_{eventIndex}`), guaranteeing no collision.
+ */
+export function buildBackfillEventId(
+  transactionHash: string,
+  eventType: string,
+  rowId: string,
+): string {
+  return `${transactionHash}_backfill_${eventType}_${rowId}`;
+}
+
+// ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
 
 /**
  * Zod schema for backfill query parameters.
@@ -16,10 +57,31 @@ const MAX_BACKFILL_LIMIT = 5000;
  * @property limit - Maximum number of rows to scan (1–5000, default 1000).
  * @property agreementId - Optional filter to only backfill events for a specific agreement.
  */
-const BackfillQuerySchema = z.object({
-  limit: z.coerce.number().int().positive().max(MAX_BACKFILL_LIMIT).optional().default(1000),
+export const BackfillQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(MAX_BACKFILL_LIMIT).optional().default(DEFAULT_BACKFILL_LIMIT),
   agreementId: z.string().optional(),
 });
+
+// ---------------------------------------------------------------------------
+// Response shape
+// ---------------------------------------------------------------------------
+
+/** A single entry inside the response `results` array. */
+export interface BackfillResultEntry {
+  employeeId?: string;
+  milestoneId?: string;
+  agreementId: string;
+  status: string;
+  error?: string;
+}
+
+/** Shape returned by both backfill endpoints on success. */
+export interface BackfillResponse {
+  message: string;
+  totalScanned: number;
+  created: number;
+  results: BackfillResultEntry[];
+}
 
 /**
  * POST /backfill/employee-events
@@ -74,16 +136,15 @@ backfillEventsRouter.post(
       `);
 
       let created = 0;
-      const results: Array<{
-        employeeId: string;
-        agreementId: string;
-        status: string;
-        error?: string;
-      }> = [];
+      const results: BackfillResultEntry[] = [];
 
       await db.transaction(async (tx) => {
         for (const employee of employeesWithoutEvents.rows) {
-          const eventId = `${employee.transaction_hash}_backfill_EmployeeAdded_${employee.id}`;
+          const eventId = buildBackfillEventId(
+            String(employee.transaction_hash),
+            "EmployeeAdded",
+            String(employee.id),
+          );
 
           await tx
             .insert(schema.agreementEvents)
@@ -94,7 +155,7 @@ backfillEventsRouter.post(
               eventType: "EmployeeAdded",
               blockNumber: Number(employee.block_number),
               transactionHash: String(employee.transaction_hash),
-              eventIndex: -1,
+              eventIndex: BACKFILL_EVENT_INDEX,
             })
             .onConflictDoNothing();
 
@@ -107,15 +168,16 @@ backfillEventsRouter.post(
         }
       });
 
-      res.json({
+      const body: BackfillResponse = {
         message: `Backfilled ${created} EmployeeAdded events`,
         totalScanned: employeesWithoutEvents.rows.length,
         created,
-        results: results.slice(0, 10),
-      });
+        results: results.slice(0, RESULTS_PREVIEW_SIZE),
+      };
+      res.json(body);
     } catch (e: any) {
-      if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+      if (e instanceof z.ZodError || e?.name === "ZodError") {
+        res.status(400).json({ error: e.errors?.[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
@@ -172,16 +234,15 @@ backfillEventsRouter.post(
       `);
 
       let created = 0;
-      const results: Array<{
-        milestoneId: string;
-        agreementId: string;
-        status: string;
-        error?: string;
-      }> = [];
+      const results: BackfillResultEntry[] = [];
 
       await db.transaction(async (tx) => {
         for (const milestone of milestonesWithoutEvents.rows) {
-          const eventId = `${milestone.transaction_hash}_backfill_MilestoneAdded_${milestone.id}`;
+          const eventId = buildBackfillEventId(
+            String(milestone.transaction_hash),
+            "MilestoneAdded",
+            String(milestone.id),
+          );
 
           await tx
             .insert(schema.agreementEvents)
@@ -192,7 +253,7 @@ backfillEventsRouter.post(
               eventType: "MilestoneAdded",
               blockNumber: Number(milestone.block_number),
               transactionHash: String(milestone.transaction_hash),
-              eventIndex: -1,
+              eventIndex: BACKFILL_EVENT_INDEX,
             })
             .onConflictDoNothing();
 
@@ -205,15 +266,16 @@ backfillEventsRouter.post(
         }
       });
 
-      res.json({
+      const body: BackfillResponse = {
         message: `Backfilled ${created} MilestoneAdded events`,
         totalScanned: milestonesWithoutEvents.rows.length,
         created,
-        results: results.slice(0, 10),
-      });
+        results: results.slice(0, RESULTS_PREVIEW_SIZE),
+      };
+      res.json(body);
     } catch (e: any) {
-      if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+      if (e instanceof z.ZodError || e?.name === "ZodError") {
+        res.status(400).json({ error: e.errors?.[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
