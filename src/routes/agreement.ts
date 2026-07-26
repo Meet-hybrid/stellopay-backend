@@ -8,40 +8,47 @@ import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
+import { StarknetAddress } from "../utils/validation.js";
+import { TxHashSchema } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 
-const AddressParam = z.string().min(3);
+const AddressParam = StarknetAddress;
 const AgreementIdParam = z.coerce.bigint().positive();
 
+const U256String = z
+  .string()
+  .trim()
+  .regex(/^(0|[1-9][0-9]{0,77})$/, "must be a valid 256-bit unsigned integer string");
+
 const WalletSession = z.object({
-  wallet_address: z.string().min(3),
+  wallet_address: StarknetAddress,
   session_token: z.string().min(10),
 });
 
 const CreateTimeBasedBody = z
   .object({
-    employer: z.string().min(3),
-    contributor: z.string().min(3),
-    token: z.string().min(3),
-    amount_per_period: z.string().min(1),
-    period_seconds: z.coerce.bigint(),
+    employer: StarknetAddress,
+    contributor: StarknetAddress,
+    token: StarknetAddress,
+    amount_per_period: U256String,
+    period_seconds: z.coerce.bigint().positive(),
     num_periods: z.coerce.number().int().positive(),
   })
   .and(WalletSession);
 
 const CreateMilestoneBody = z
   .object({
-    employer: z.string().min(3),
-    contributor: z.string().min(3),
-    token: z.string().min(3),
+    employer: StarknetAddress,
+    contributor: StarknetAddress,
+    token: StarknetAddress,
   })
   .and(WalletSession);
 
 const CreatePayrollBody = z
   .object({
-    employer: z.string().min(3),
-    token: z.string().min(3),
-    period_seconds: z.coerce.bigint(),
+    employer: StarknetAddress,
+    token: StarknetAddress,
+    period_seconds: z.coerce.bigint().positive(),
     num_periods: z.coerce.number().int().positive(),
   })
   .and(WalletSession);
@@ -55,7 +62,7 @@ const AgreementIdBody = z
 const AddMilestoneBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    amount: z.string().min(1),
+    amount: U256String,
   })
   .and(WalletSession);
 
@@ -69,15 +76,15 @@ const MilestoneIdBody = z
 const FundAgreementBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    amount: z.string().min(1),
+    amount: U256String,
   })
   .and(WalletSession);
 
 const AddEmployeeBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    employee: z.string().min(3),
-    salary_per_period: z.string().min(1),
+    employee: StarknetAddress,
+    salary_per_period: U256String,
   })
   .and(WalletSession);
 
@@ -91,14 +98,14 @@ const ClaimPayrollBody = z
 const ResolveDisputeBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    pay_contributor: z.string().min(1),
-    refund_employer: z.string().min(1),
+    pay_contributor: U256String,
+    refund_employer: U256String,
   })
   .and(WalletSession);
 
 const InitAgreementBody = WalletSession.extend({
-  escrow: z.string().min(3),
-  arbiter: z.string().min(3),
+  escrow: StarknetAddress,
+  arbiter: StarknetAddress,
 });
 
 export const agreementRouter = Router();
@@ -965,7 +972,7 @@ agreementRouter.post("/prepare/agreement/:address/raise_dispute", async (req, re
 agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
-    const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.body);
+    const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.body);
 
     // Ensure tx_hash is properly formatted (should start with 0x and be 66 chars)
     let formattedTxHash = tx_hash;
