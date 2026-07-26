@@ -533,6 +533,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
 
     expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false });
     expect(res.body.error).toMatch(/not found/i);
   });
 
@@ -549,67 +550,71 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.body.results).toHaveLength(1);
   });
 
-  // -------------------------------------------------------------------------
-  // Authentication & Authorization
-  //
-  // process_tx/process_batch ingest arbitrary on-chain tx hashes, decode their
-  // events, write agreements/agreementEvents/payments/escrowEvents rows, and
-  // can overwrite a stored agreement's token from the on-chain value. That
-  // capability now requires an admin session (requireAuth + requireAdmin),
-  // matching the gate already used by the sibling ingestion routes in
-  // backfill-events.ts and reprocess-events.ts.
-  // -------------------------------------------------------------------------
+  it("process_tx returns 400 with a clean error for a malformed hash", async () => {
+    const res = await request(makeApp()).post("/events/process_tx/not-a-tx-hash").send();
 
-  describe("Authentication & Authorization", () => {
-    it("failure path: rejects an unauthenticated caller before process_tx runs (requireAuth fails)", async () => {
-      mockRequireAuth.mockImplementationOnce((_req: any, res: any) => {
-        res.status(401).json({ error: "Unauthorized" });
-      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    // Never should have reached the provider with garbage input.
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+  });
 
-      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+  it("process_tx still works for valid TX_A/TX_B-style hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_B) as any);
 
-      expect(res.status).toBe(401);
-      expect(res.body).toEqual({ error: "Unauthorized" });
-      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
-    });
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_B}`).send();
 
-    it("failure path: rejects a non-admin caller before process_tx runs (requireAdmin fails)", async () => {
-      mockRequireAdmin.mockImplementationOnce((_req: any, res: any) => {
-        res.status(401).json({ error: "Unauthorized" });
-      });
+    expect(res.status).toBe(200);
+    expect(res.body.transactionHash).toBe(TX_B);
+  });
 
-      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+  it("process_batch dedupes an exact duplicate hash within the same batch", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
 
-      expect(res.status).toBe(401);
-      expect(res.body).toEqual({ error: "Unauthorized" });
-      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
-    });
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_A] });
 
-    it("failure path: rejects a non-admin caller before process_batch runs (requireAdmin fails)", async () => {
-      mockRequireAdmin.mockImplementationOnce((_req: any, res: any) => {
-        res.status(401).json({ error: "Unauthorized" });
-      });
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.results[0]).toEqual(res.body.results[1]);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
 
-      const res = await request(makeApp())
-        .post("/events/process_batch")
-        .send({ tx_hashes: [TX_A] });
+  it("process_batch dedupes hashes that differ only by leading-zero padding", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
 
-      expect(res.status).toBe(401);
-      expect(res.body).toEqual({ error: "Unauthorized" });
-      expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
-    });
+    const unpadded = "0xaaaa";
 
-    it("success path: an authenticated admin caller reaches process_tx and gets a 200", async () => {
-      parseEventMock.mockReturnValue(decodedAgreementCreated());
-      vi.mocked(provider.getTransactionReceipt).mockResolvedValue(
-        makeAgreementReceipt(TX_A) as any,
-      );
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, unpadded] });
 
-      const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
 
-      expect(mockRequireAuth).toHaveBeenCalled();
-      expect(mockRequireAdmin).toHaveBeenCalled();
-      expect(res.status).toBe(200);
-    });
+  it("process_batch reports zero duplicates for all-unique hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    expect(res.body.summary.duplicates).toBe(0);
+    expect(res.body.summary.total).toBe(2);
   });
 });

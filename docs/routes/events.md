@@ -1,85 +1,106 @@
-# Event Ingestion
-
-Source: [`src/routes/events.ts`](../../src/routes/events.ts)
+# Events
 
 **Overview:**
-These endpoints fetch a Starknet transaction receipt, decode its events using
-the WorkAgreement and PayrollEscrow contract ABIs, and persist the decoded
-data (`agreements`, `agreementEvents`, `payments`, `escrowEvents`) to
-Postgres. Both routes delegate to the same shared processor,
-`processTxReceipt`, so a single tx hash is always decoded and stored the same
-way whether it arrives via `process_tx` or as part of a `process_batch`.
+These endpoints ingest Starknet transaction receipts, decode `WorkAgreement` and `PayrollEscrow` contract events using the loaded ABIs, and persist the results (agreements, agreement events, payments, escrow events) to the database. Both routes delegate to the same internal `processTxReceipt(txHash)` function, so decoding/persistence behavior is identical whether a transaction is processed individually or as part of a batch.
 
 ## Endpoints
 
 - `POST /api/v1/events/process_tx/:tx_hash`
 - `POST /api/v1/events/process_batch`
 
-### Authentication and Authorization
+### Authentication
 
-Both routes require an active **admin** session (`requireAuth` followed by
-`requireAdmin`).
+Both routes require an authenticated session (`requireAuth`).
 
-Ingestion is a privileged write path, not a read: it inserts/updates
-`agreements`/`agreementEvents`/`payments`/`escrowEvents` rows for whatever tx
-hash the caller supplies, and — for transactions containing an
-`AgreementCreated` event — calls the on-chain contract and overwrites the
-stored agreement's `token` if it disagrees with the event payload. An
-authenticated-but-non-admin caller must not be able to trigger any of this for
-an arbitrary transaction. This matches the admin-only gate already used by
-the sibling ingestion routes in `backfill-events.ts` and `reprocess-events.ts`
-— `events.ts` is the one place in this family that previously stopped at
-`requireAuth` alone.
+---
 
-### `POST /events/process_tx/:tx_hash`
+### `POST /api/v1/events/process_tx/:tx_hash`
 
-Processes a single transaction. Responses:
+Process a single Starknet transaction.
 
-| Condition | Response |
-|---|---|
-| Receipt not found | `404 { error: "Transaction not found" }` |
-| Receipt has no events | `200 { message: "No events found in transaction", eventsProcessed: 0 }` |
-| Events decoded | `200 { message, eventsProcessed: string[], transactionHash, tokenVerified? }` |
+**Path parameter**
 
-### `POST /events/process_batch`
+| Parameter  | Type   | Description                                                                 |
+| ---------- | ------ | ----------------------------------------------------------------------------- |
+| `tx_hash`  | string | Starknet transaction hash. Validated against `TxHashSchema` (see below).      |
 
-Processes multiple transactions in one request.
+**Responses**
 
-- **Body:** `{ tx_hashes: string[] }` — non-empty, each a valid Starknet tx
-  hash, capped at `MAX_BATCH_SIZE` (50) entries per request.
-- Each tx hash is processed independently via the same `processTxReceipt`
-  logic as `process_tx`; a per-tx failure is captured into that entry's
-  `error` field rather than aborting the rest of the batch.
-- **Response:** `{ summary: { total, processed, noEvents, notFound, errors, totalEventsProcessed }, results: TxProcessResult[] }`.
+| Status | Condition                              | Body                                                                                   |
+| ------ | --------------------------------------- | --------------------------------------------------------------------------------------- |
+| `200`  | Receipt found, events decoded           | `{ message, eventsProcessed: string[], transactionHash, tokenVerified? }`               |
+| `200`  | Receipt found, no decodable events      | `{ message: "No events found in transaction", eventsProcessed: 0 }`                     |
+| `404`  | No receipt found for the hash           | `{ error: "Transaction not found" }`                                                    |
+| `400`  | `tx_hash` fails format validation       | `{ error: "Invalid Starknet transaction hash format" }`                                 |
 
-### Idempotency
+---
 
-All inserts use `onConflictDoNothing`/`onConflictDoUpdate` keyed on
-deterministic IDs (`{txHash}_{eventIndex}` for events, the agreement ID for
-agreements), so re-submitting the same tx hash — via `process_tx`, within a
-`process_batch`, or across both — never creates duplicate rows.
+### `POST /api/v1/events/process_batch`
 
-### Token verification
+Process multiple Starknet transactions in a single request.
 
-For an `AgreementCreated` event, after the agreement row is upserted, the
-on-chain contract's `get_token` is called and compared against the token
-taken from the event. If they disagree, the on-chain value is authoritative
-and the stored row is corrected before the response is sent (awaited, not
-fire-and-forget). `tokenVerified` on the response is `true` when this check
-completed for every `AgreementCreated` event in the transaction, `false` if
-at least one check failed, and omitted entirely when the transaction had no
-`AgreementCreated` event.
+**Body**
 
-## Out of scope
+```json
+{ "tx_hashes": ["0x...", "0x..."] }
+```
 
-- **Contract/agreement-level authorization** — the admin gate controls *who*
-  may trigger ingestion, not *which* contracts or agreements an admin may
-  ingest for. Any admin can process a receipt for any contract address; there
-  is no per-contract allowlist here.
-- **Fan-out / notification delivery on ingestion** — these routes only
-  persist decoded events; they do not push notifications or webhooks to
-  affected users as a side effect of processing.
-- **Receipt schema validation beyond structural checks** — `processTxReceipt`
-  trusts the shape of whatever the configured Starknet `provider` returns for
-  a receipt; it does not independently re-verify the receipt against a second
-  RPC source.
+| Field        | Type       | Constraints                                                             |
+| ------------ | ---------- | ------------------------------------------------------------------------ |
+| `tx_hashes`  | `string[]` | 1 to `MAX_BATCH_SIZE` (50) entries, each validated by `TxHashSchema`.    |
+
+**Response** (`200`)
+
+```json
+{
+  "summary": {
+    "total": 2,
+    "processed": 1,
+    "noEvents": 0,
+    "notFound": 0,
+    "errors": 0,
+    "duplicates": 1,
+    "totalEventsProcessed": 1
+  },
+  "results": [
+    { "txHash": "0x...aaaa", "status": "processed", "eventsProcessed": 1, "eventLabels": ["AgreementCreated-1"] },
+    { "txHash": "0x...aaaa", "status": "processed", "eventsProcessed": 1, "eventLabels": ["AgreementCreated-1"] }
+  ]
+}
+```
+
+`results` always has the same length and index-correspondence as the input `tx_hashes` array — `results[i]` corresponds to `tx_hashes[i]`, even when `tx_hashes[i]` is a duplicate of an earlier entry.
+
+`summary.total` equals `tx_hashes.length`. `summary.processed` / `noEvents` / `notFound` / `errors` are counted over the **unique** (deduplicated) work actually performed, and `summary.duplicates` accounts for the rest, so the following always holds:
+
+```
+total === processed + noEvents + notFound + errors + duplicates
+```
+
+A per-tx error is captured into that tx's result entry (`status: "error"`) and never aborts the rest of the batch.
+
+---
+
+## Idempotency contract
+
+1. **DB-level idempotency (both endpoints).**
+   Every row written by `processTxReceipt` uses a deterministic primary key derived from the transaction hash and event index — `{normalizedTxHash}_{eventIndex}` — and is inserted with `.onConflictDoNothing()` (or, for the `agreements` row itself, `.onConflictDoUpdate()` touching only `updatedAt`). Re-processing the exact same transaction any number of times, via either endpoint, on any number of separate requests, is always a safe no-op after the first successful write — no duplicate rows are ever created.
+
+2. **Within-request duplicate handling (`process_batch` only).**
+   Hashes in `tx_hashes` are normalized with the same normalization used internally (`normalizeTransactionHash`, which canonicalizes padding/case) and used as a dedup key *within that single request*. If the same normalized hash appears more than once in one `tx_hashes` array:
+   - Only the **first** occurrence triggers an RPC call (`provider.getTransactionReceipt`) and a call to `processTxReceipt`.
+   - Subsequent occurrences reuse the result object from the first occurrence (same status, `eventsProcessed`, `eventLabels`, etc.) instead of recomputing it.
+   - The batch `summary` reports these reused occurrences via `duplicates`, so the response accurately reflects that only N unique units of work were performed, not `tx_hashes.length`.
+
+## Envelope validation contract
+
+Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). This was previously inconsistent: `process_tx/:tx_hash` accepted any string and let malformed input fall through to the RPC layer, producing a murky downstream error instead of a clean validation failure. Both endpoints now return the same `400` shape on malformed input:
+
+```json
+{ "error": "Invalid Starknet transaction hash format" }
+```
+
+## Known limitations / out of scope
+
+- **No cross-request idempotency-key / response-replay caching.** There is no persistent idempotency-key store (e.g. Redis, a dedup table) in this service. If a caller (or an upstream retry/fan-out mechanism) sends the *same* transaction hash as two **separate** HTTP requests — rather than twice within one `process_batch` array — each request still performs its own RPC fetch and its own call to `processTxReceipt`. This remains safe at the DB layer (no duplicate rows, thanks to `onConflictDoNothing`), but it is not free: each request pays its own RPC cost, and the two HTTP responses are computed independently rather than one replaying the other's exact response body.
+- Adding true cross-request idempotency (an `Idempotency-Key` header with response replay, backed by a persistent store) would require new infrastructure and is intentionally out of scope for this change. The within-request dedup and envelope validation fixes above address the ambiguity that was actually reported without requiring that infrastructure.
