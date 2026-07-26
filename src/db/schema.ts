@@ -7,7 +7,9 @@ import {
   timestamp,
   index,
   numeric,
+  check,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 /**
  * Index convention (enforced by schema-consistency.test.ts):
@@ -16,6 +18,21 @@ import {
  * non-relational identifiers (e.g. taxId) are excluded. Missing indexes hurt join and filter
  * performance as tables grow.
  */
+
+// ---------------------------------------------------------------------------
+// Shared constraint helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Regex pattern that matches a valid unsigned-256-bit decimal integer string.
+ * Accepts "0" and any positive integer up to 78 digits (the max decimal width
+ * of 2^256 - 1 is 78 digits). Leading zeros are intentionally rejected to keep
+ * the canonical form unambiguous.
+ *
+ * Used as a DB-level CHECK constraint on every `amount` column that stores a
+ * Cairo u256 value serialised as a decimal string.
+ */
+const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
 
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
@@ -42,6 +59,32 @@ export const agreements = pgTable(
     employerIdx: index("agreements_employer_idx").on(table.employer),
     contributorIdx: index("agreements_contributor_idx").on(table.contributor),
     statusIdx: index("agreements_status_idx").on(table.status),
+    // CHECK constraints â€” reject malformed inputs before they reach application code
+    modeCheck: check("agreements_mode_check", sql`${table.mode} IN (0, 1)`),
+    paymentTypeCheck: check(
+      "agreements_payment_type_check",
+      sql`${table.paymentType} IN (0, 1, 2)`,
+    ),
+    statusCheck: check(
+      "agreements_status_check",
+      sql`${table.status} BETWEEN 0 AND 5`,
+    ),
+    disputeStatusCheck: check(
+      "agreements_dispute_status_check",
+      sql`${table.disputeStatus} IN (0, 1, 2)`,
+    ),
+    blockNumberCheck: check(
+      "agreements_block_number_check",
+      sql`${table.blockNumber} >= 0`,
+    ),
+    totalAmountCheck: check(
+      "agreements_total_amount_check",
+      sql`${table.totalAmount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    paidAmountCheck: check(
+      "agreements_paid_amount_check",
+      sql`${table.paidAmount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -63,6 +106,14 @@ export const agreementEvents = pgTable(
     contractAddressIdx: index("agreement_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("agreement_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("agreement_events_block_number_idx").on(table.blockNumber),
+    blockNumberCheck: check(
+      "agreement_events_block_number_check",
+      sql`${table.blockNumber} >= 0`,
+    ),
+    eventIndexCheck: check(
+      "agreement_events_event_index_check",
+      sql`${table.eventIndex} >= 0`,
+    ),
   }),
 );
 
@@ -87,6 +138,15 @@ export const payments = pgTable(
     fromIdx: index("payments_from_idx").on(table.from),
     toIdx: index("payments_to_idx").on(table.to),
     blockNumberIdx: index("payments_block_number_idx").on(table.blockNumber),
+    blockNumberCheck: check("payments_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "payments_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    eventTypeCheck: check(
+      "payments_event_type_check",
+      sql`${table.eventType} IN ('PaymentSent', 'PaymentReceived')`,
+    ),
   }),
 );
 
@@ -110,6 +170,12 @@ export const milestones = pgTable(
   (table) => ({
     agreementIdIdx: index("milestones_agreement_id_idx").on(table.agreementId),
     milestoneIdIdx: index("milestones_milestone_id_idx").on(table.milestoneId),
+    milestoneIdCheck: check("milestones_milestone_id_check", sql`${table.milestoneId} >= 0`),
+    blockNumberCheck: check("milestones_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "milestones_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -132,6 +198,16 @@ export const employees = pgTable(
   (table) => ({
     agreementIdIdx: index("employees_agreement_id_idx").on(table.agreementId),
     employeeAddressIdx: index("employees_employee_address_idx").on(table.employeeAddress),
+    employeeIndexCheck: check("employees_employee_index_check", sql`${table.employeeIndex} >= 0`),
+    claimedPeriodsCheck: check(
+      "employees_claimed_periods_check",
+      sql`${table.claimedPeriods} >= 0`,
+    ),
+    blockNumberCheck: check("employees_block_number_check", sql`${table.blockNumber} >= 0`),
+    salaryCheck: check(
+      "employees_salary_per_period_check",
+      sql`${table.salaryPerPeriod} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -155,6 +231,15 @@ export const escrowEvents = pgTable(
     contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
+    blockNumberCheck: check("escrow_events_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "escrow_events_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    eventTypeCheck: check(
+      "escrow_events_event_type_check",
+      sql`${table.eventType} IN ('Funded', 'Released', 'Refunded')`,
+    ),
   }),
 );
 
@@ -208,6 +293,22 @@ export const billingProfiles = pgTable(
   },
   (table) => ({
     ownerAddressIdx: index("billing_profiles_owner_address_idx").on(table.ownerAddress),
+    profileTypeCheck: check(
+      "billing_profiles_profile_type_check",
+      sql`${table.profileType} IN ('Individual', 'Business')`,
+    ),
+    currencyCheck: check(
+      "billing_profiles_currency_check",
+      sql`${table.currency} ~ '^[A-Z]{3}$'`,
+    ),
+    annualRewardLimitCheck: check(
+      "billing_profiles_annual_reward_limit_check",
+      sql`${table.annualRewardLimit} >= 0`,
+    ),
+    usedAmountCheck: check(
+      "billing_profiles_used_amount_check",
+      sql`${table.usedAmount} >= 0`,
+    ),
   }),
 );
 
@@ -234,6 +335,10 @@ export const billingPaymentMethods = pgTable(
   },
   (table) => ({
     profileIdIdx: index("billing_payment_methods_profile_id_idx").on(table.profileId),
+    typeCheck: check(
+      "billing_payment_methods_type_check",
+      sql`${table.type} IN ('bank_account', 'paypal', 'crypto', 'wire', 'check', 'other')`,
+    ),
   }),
 );
 
@@ -258,8 +363,50 @@ export const billingInvoices = pgTable(
   (table) => ({
     profileIdIdx: index("billing_invoices_profile_id_idx").on(table.profileId),
     statusIdx: index("billing_invoices_status_idx").on(table.status),
+    statusCheck: check(
+      "billing_invoices_status_check",
+      sql`${table.status} IN ('pending', 'paid', 'void')`,
+    ),
+    currencyCheck: check(
+      "billing_invoices_currency_check",
+      sql`${table.currency} ~ '^[A-Z]{3}$'`,
+    ),
+    amountCheck: check("billing_invoices_amount_check", sql`${table.amount} >= 0`),
   }),
 );
+
+
+// ---------------------------------------------------------------------------
+// Pagination & Batching Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum rows per page across all list endpoints. */
+export const MAX_PAGE_SIZE = 100;
+
+/** Default page size when the caller does not specify a limit. */
+export const DEFAULT_PAGE_SIZE = 50;
+
+/** Maximum batch size for bulk operations (inserts, updates, deletes). */
+export const MAX_BATCH_SIZE = 100;
+
+/**
+ * Clamp a caller-supplied limit to the allowed pagination range [1, MAX_PAGE_SIZE].
+ * Values <= 0 default to DEFAULT_PAGE_SIZE. Values > MAX_PAGE_SIZE are capped.
+ */
+export function clampPageLimit(requested: number): number {
+  if (requested <= 0) return DEFAULT_PAGE_SIZE;
+  return Math.min(requested, MAX_PAGE_SIZE);
+}
+
+/**
+ * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
+ * validate before proceeding with a bulk operation.
+ */
+export function clampBatchSize(requested: number): number {
+  if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
+  return requested;
+}
 
 // Sessions table - stores auth sessions with sliding and absolute expiry
 export const sessions = pgTable(
@@ -284,3 +431,4 @@ export const sessions = pgTable(
     familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );
+
