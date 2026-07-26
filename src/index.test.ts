@@ -2,6 +2,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pool } from "pg";
 import { app } from "./index.js";
+import { setApplicationReady } from "./middleware/db-readiness.js";
 
 describe("GET /ready", () => {
   let querySpy: ReturnType<typeof vi.spyOn>;
@@ -32,5 +33,33 @@ describe("GET /ready", () => {
 
     expect(response.status).toBe(503);
     expect(response.body).toEqual({ ok: false });
+  });
+});
+
+describe("startup DB readiness gating", () => {
+  afterEach(() => {
+    setApplicationReady(true);
+  });
+
+  it("returns 503 for API routes before readiness and serves them after", async () => {
+    setApplicationReady(false);
+
+    const blocked = await request(app).get("/api/v1/no-such-route");
+    expect(blocked.status).toBe(503);
+    expect(blocked.body.message).toBe("Database is not ready");
+
+    setApplicationReady(true);
+
+    const allowed = await request(app).get("/api/v1/no-such-route");
+    expect(allowed.status).toBe(404);
+    expect(allowed.body.error).toBe("Route not found");
+  });
+
+  it("still serves /health while API traffic is gated", async () => {
+    setApplicationReady(false);
+
+    const health = await request(app).get("/health");
+    expect(health.status).toBe(200);
+    expect(health.body).toEqual({ ok: true });
   });
 });

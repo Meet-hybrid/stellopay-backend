@@ -209,6 +209,7 @@ The service uses a configured Postgres pool with explicit limits and timeouts. T
 - `GET /ready` runs `SELECT 1` against the database and returns:
   - `200` when the database responds successfully.
   - `503` when the database is unreachable or returns an error.
+- During startup, the HTTP server may accept connections before Postgres is verified. Until the initial DB readiness check succeeds, all routes except `/health` and `/ready` respond with `503` instead of surfacing connection errors from handlers.
 
 The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
 
@@ -251,6 +252,7 @@ The service uses a configured Postgres pool with explicit limits and timeouts. T
 - `GET /ready` runs `SELECT 1` against the database and returns:
   - `200` when the database responds successfully.
   - `503` when the database is unreachable or returns an error.
+- During startup, the HTTP server may accept connections before Postgres is verified. Until the initial DB readiness check succeeds, all routes except `/health` and `/ready` respond with `503` instead of surfacing connection errors from handlers.
 
 The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
 
