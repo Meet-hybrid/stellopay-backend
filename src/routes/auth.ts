@@ -88,6 +88,12 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       ok: true,
       address,
       session_token: session.token,
+      // The token returned as `session_token` is also valid as the initial
+      // `refresh_token` for /auth/refresh (createSession issues a single,
+      // dual-role token). Exposing both field names here means a caller
+      // reading only this response can discover that contract without
+      // needing to read /auth/refresh's response shape too.
+      refresh_token: session.token,
       expires_in_ms: session.expires_in_ms,
     });
   } catch (e) {
@@ -145,6 +151,10 @@ authRouter.post("/auth/refresh", async (req, res, next) => {
       ok: true,
       address,
       refresh_token: result.token,
+      // The rotated token is likewise dual-role: it is both the next
+      // refresh_token and a valid bearer session_token for protected
+      // routes / /auth/session/validate. See docs/routes/auth.md.
+      session_token: result.token,
       expires_in_ms: result.expires_in_ms,
     });
   } catch (e) {

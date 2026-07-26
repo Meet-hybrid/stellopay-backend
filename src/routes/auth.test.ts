@@ -166,6 +166,12 @@ describe("Auth Routes Integration", () => {
     expect(verifyRes.body.session_token).toBeDefined();
     expect(verifyRes.body.expires_in_ms).toBeDefined();
 
+    // /auth/verify's token plays a dual role: the same value is returned
+    // under both field names so a caller reading only this response can
+    // discover it is also usable as the initial refresh_token.
+    expect(verifyRes.body.refresh_token).toBeDefined();
+    expect(verifyRes.body.refresh_token).toBe(verifyRes.body.session_token);
+
     const sessionToken = verifyRes.body.session_token;
 
     // Verify database only has the SHA-256 hash
@@ -327,6 +333,12 @@ describe("Auth Routes Integration", () => {
     expect(secondToken).toBeDefined();
     expect(secondToken).not.toBe(firstToken);
 
+    // /auth/refresh's rotated token is likewise dual-role: the same value is
+    // returned under both field names so a caller reading only this
+    // response can discover it is also usable as a bearer session_token.
+    expect(refreshRes.body.session_token).toBeDefined();
+    expect(refreshRes.body.session_token).toBe(refreshRes.body.refresh_token);
+
     // The old token no longer refreshes.
     const reuseOldRes = await request(appInstance)
       .post("/api/v1/auth/refresh")
@@ -391,5 +403,47 @@ describe("Auth Routes Integration", () => {
       .post("/api/v1/auth/refresh")
       .send({ address, refresh_token: token });
     expect(refreshAfterRevokeRes.status).toBe(401);
+  });
+
+  it("invalidates a previously issued challenge when a new one is requested for the same address", async () => {
+    const address = "0xChallengeOverwrite";
+    const appInstance = makeApp();
+
+    // Issue a first challenge, then a second before the first is ever consumed.
+    const firstChallengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address });
+    expect(firstChallengeRes.status).toBe(200);
+    const firstNonce = firstChallengeRes.body.nonce;
+
+    const secondChallengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address });
+    expect(secondChallengeRes.status).toBe(200);
+    const secondNonce = secondChallengeRes.body.nonce;
+
+    // Only one challenge can ever be outstanding per address: issuing the
+    // second silently invalidated the first (they are distinct nonces).
+    expect(secondNonce).not.toBe(firstNonce);
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+
+    // Exactly one verify attempt succeeds for the address, consuming the
+    // sole (second) surviving challenge.
+    const verifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    expect(verifyRes.status).toBe(200);
+    expect(verifyRes.body.ok).toBe(true);
+
+    // A second verify attempt for the same address — standing in for a
+    // caller that tried to redeem the *first* (overwritten) challenge —
+    // now finds no active challenge at all, proving the first challenge
+    // was invalidated rather than retained as a fallback.
+    const staleVerifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    expect(staleVerifyRes.status).toBe(400);
+    expect(staleVerifyRes.body.error).toMatch(/No active challenge/);
   });
 });
