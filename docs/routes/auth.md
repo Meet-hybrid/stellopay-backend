@@ -1,93 +1,180 @@
-# `/api/v1/auth/*` — contract reference
+# Auth Routes
 
-This document is the executable counterpart to the TSDoc on the route handlers in `src/routes/auth.ts`. If the two ever disagree, the TSDoc wins for line-level details and this document wins for design intent and the idempotency contract.
+Wallet-based authentication for Starknet accounts: a signed-nonce challenge
+proves wallet ownership, after which the backend issues a session/refresh
+token pair used for subsequent requests. All routes are mounted under
+`/api/v1` and implemented in `src/routes/auth.ts`, backed by
+`src/auth/challenge.ts` (nonce issuance) and `src/auth/session.ts`
+(session/refresh-token lifecycle).
 
-## Surface
+## Lifecycle
 
-All endpoints live under `/api/v1/auth/*`. All POST endpoints accept a JSON body and respond with JSON.
+```
+challenge  ->  verify (login)  ->  session/validate  ->  refresh  ->  logout / revoke
+```
 
-| Method | Path                         | Auth required | Idempotent on retry? | Body shape (Zod)                                              |
-| ------ | ---------------------------- | ------------- | -------------------- | ------------------------------------------------------------- |
-| POST   | `/auth/challenge`            | no            | **yes (within TTL)** | `{ address: string (≥3 chars) }`                              |
-| POST   | `/auth/verify`               | no            | yes (terminal)       | `{ address, signature: string[] (≥2) }`                       |
-| POST   | `/auth/session/validate`     | no            | yes (read-only)      | `{ address, session_token: string (≥10) }`                    |
-| POST   | `/auth/refresh`              | no            | deterministic / input-bound | `{ address, refresh_token: string (≥10) }`              |
-| POST   | `/auth/logout`               | yes (`requireAuth`) | on the wire, no  | (no body)                                                     |
-| POST   | `/auth/revoke`               | yes (`requireAuth`) | on the wire, no  | (no body)                                                     |
+### 1. `POST /auth/challenge`
 
-## Per-endpoint contract
+Issues a short-lived nonce the caller's wallet must sign to prove ownership.
 
-### POST `/auth/challenge`
+Request:
 
-**Idempotent on retry within the TTL window.** `createChallenge` in `src/auth/challenge.ts` checks for an active record before generating a fresh one. A duplicate call:
+```json
+{ "address": "0x123..." }
+```
 
-- returns the SAME nonce (no fresh `challenge_created` metric; one `challenge_replayed` instead);
-- does NOT push the TTL forward — `expires_in_ms` decreases as time passes;
-- returns the same `typed_data` payload.
+Response `200`:
 
-A retry **after** the TTL has elapsed returns a fresh nonce and a fresh 5-minute window. A retry **after** the nonce has been consumed (i.e. verify succeeded) also returns a fresh nonce — the slot is reusable.
+```json
+{
+  "address": "0x123...",
+  "nonce": "0x...",
+  "expires_in_ms": 300000,
+  "chain_id": "0x534e5f5345504f4c4941",
+  "typed_data": { "...": "SNIP-12 typed data payload to sign" }
+}
+```
 
-**Failure shape:** the route responds with `400 { "error": "<Zod issue message>" }` for malformed addresses, and `500` (via the global error handler) for any unexpected exception. There is no rate limiting at this layer; the global rate limiter (`src/middleware/rate-limit.ts`) handles traffic shaping.
+**Single-outstanding-challenge-per-address:** issuing a new challenge for an
+address unconditionally overwrites any previous, unconsumed challenge for
+that same address. Only the most recently issued nonce is ever valid — if a
+caller requests two challenges back-to-back without verifying in between,
+the first nonce is silently invalidated and any later attempt to verify
+against it fails with `400 "No active challenge (or expired)"`. This is
+intentional (it keeps the challenge store bounded to one entry per address
+and avoids stale-nonce accumulation), not a bug.
 
-### POST `/auth/verify`
+### 2. `POST /auth/verify` (login)
 
-**Idempotent on the wire, terminal in semantics.** Each call MUST consume the active challenge atomically (via `consumeChallenge` in `src/auth/challenge.ts`) before the async signature check. Two concurrent calls with the same challenge resolve to exactly one `200` (and one new session row) and one `400 { "error": "No active challenge (or expired). Call /auth/challenge again." }`. Sequential retries after a successful verify resolve to `400` because the challenge is gone.
+Verifies the signed challenge and, on success, creates a new session.
 
-This is the property the prior replay test pins down: even if a client retries a successful `200` blindly, no second session row is created and no second signed nonce is exposed. Session issuance is therefore safe under retry.
+Request:
 
-**Failure shape:**
-- `400 { "error": "No active challenge (or expired). Call /auth/challenge again." }` if the challenge is missing, expired, or already consumed.
-- `401 { "error": "Invalid signature" }` if `provider.verifyMessageInStarknet` returns false.
-- `500` for any unexpected exception.
+```json
+{ "address": "0x123...", "signature": ["0x...", "0x..."] }
+```
 
-### POST `/auth/session/validate`
+Response `200`:
 
-**Idempotent on retry; read-only.** This endpoint does not consume or rotate the session; it returns `200 { ok: true, address }` for as long as the session is valid, or `401 { ok: false, error: "Invalid session" }` once it has expired, been revoked, or been rotated out.
+```json
+{
+  "ok": true,
+  "address": "0x123...",
+  "session_token": "raw-token",
+  "refresh_token": "raw-token",
+  "expires_in_ms": 3600000
+}
+```
 
-The repo's test suite calls it three times consecutively against the same token and asserts all three succeed.
+`session_token` and `refresh_token` are **the same value** — see
+"Dual-role token contract" below. Errors: `400` if there is no active
+challenge for the address (never requested, already consumed, or
+overwritten by a later challenge); `401` if signature verification fails.
 
-### POST `/auth/refresh`
+### 3. `POST /auth/session/validate`
 
-**Deterministic per input token; not strictly idempotent across rotations.** Each call rotates the presented refresh token: the old token is marked rotated, a new token is issued in the same family, and a successful response returns `{ ok: true, address, refresh_token, expires_in_ms }`. Replaying the now-stale token results in `401` (and revokes the whole token family — a token-theft signal, see `rotateSession` in `src/auth/session.ts`).
+Validates a `session_token` (e.g. so a frontend can detect a backend
+restart or an expired/revoked session without hitting a protected route).
 
-This is the right semantics for a refresh endpoint: retries must NOT silently return the same token, because doing so would defeat rotation as a compromise-detection mechanism. If you want strict idempotency here, you need `Idempotency-Key` header support — not added in this PR.
+Request:
 
-### POST `/auth/logout`
+```json
+{ "address": "0x123...", "session_token": "raw-token" }
+```
 
-**Idempotent on the wire only when the session is still valid.** A first call returns `200 { ok: true }` and revokes the session row. A second call with the same (now-revoked) token fails `requireAuth` (because the session is no longer valid) and returns the same generic `401 { "error": "Unauthorized" }` envelope as any other unauthorized call. The two responses are deliberately indistinguishable to a probe.
+Response: `200 { "ok": true, "address": "0x123..." }` or
+`401 { "ok": false, "error": "Invalid session" }`.
 
-`requireAuth` is wired first in the chain, so any malformed header / unknown-token / revoked-token / expired-token case collapses to the same `401` body — there is no need for an explicit "session already revoked" code path.
+### 4. `POST /auth/refresh`
 
-### POST `/auth/revoke`
+Rotates a refresh token: the presented token is consumed and a new one is
+issued in the same token family.
 
-Same envelope semantics as `/auth/logout`: a valid session yields `200`, an already-revoked session yields the generic `401`. Both forms are documented as "safe under retry" — a client retry does not produce a different row state, and the revoke endpoint is itself idempotent in its effect on the database (`UPDATE … SET revokedAt = NOW()` over already-revoked rows is a no-op).
+Request:
 
-## Why `Idempotency-Key` is NOT wired here
+```json
+{ "address": "0x123...", "refresh_token": "raw-token" }
+```
 
-The billing router (`src/routes/billing.ts`) already implements an `Idempotency-Key` cache via `withBillingIdempotency`. That pattern fits billing because billing endpoints mutate profile state and are routinely called from frontends that retry on network timeouts.
+Response `200`:
 
-The `/auth/*` endpoints do NOT need that layer because:
+```json
+{
+  "ok": true,
+  "address": "0x123...",
+  "refresh_token": "new-raw-token",
+  "session_token": "new-raw-token",
+  "expires_in_ms": 3600000
+}
+```
 
-- `/auth/challenge` is naturally idempotent via the challenge Map (see above).
-- `/auth/verify` is naturally single-shot via `consumeChallenge`.
-- `/auth/session/validate` is read-only.
-- `/auth/refresh`, `/auth/logout`, `/auth/revoke` are guarded by `requireAuth` and the session lifecycle, so a retry either succeeds deterministically or fails closed.
+`refresh_token` and `session_token` are again **the same value**. Error:
+`401 { "ok": false, "error": "Invalid refresh token" }` if the token is
+unknown, expired, address-mismatched, or has already been rotated/revoked
+(see the reuse-detection model below).
 
-Adding `Idempotency-Key` here would duplicate natural idempotency and complicate the failure envelope without changing outcomes. It is intentionally out of scope.
+### 5. `POST /auth/logout` (requires bearer auth)
 
-## Out of scope (intentional non-goals)
+Revokes the single session token used to authenticate the request.
+`200 { "ok": true }`, or `401` if the presented token is not a valid
+session.
 
-- **`Idempotency-Key` caching on `/auth/challenge` / `/auth/verify` / `/auth/refresh`.** See above.
-- **Cross-instance challenge replication.** A challenge issued by instance A is not visible to instance B. See `docs/auth/challenge.md`.
-- **Returning a different status code for "already revoked" on logout/revoke.** The generic `401` envelope is intentional; do not leak the distinction.
-- **Logging the body of `/auth/verify`.** The route-level debug logger redacts `session_token` and `signature`; do not weaken that.
-- **Adding rate-limit headers to `/auth/challenge`.** Rate limits live in `src/middleware/rate-limit.ts`, not here.
+### 6. `POST /auth/revoke` (requires bearer auth)
 
-## Change management
+Revokes every outstanding session/refresh token for the authenticated
+address ("sign out everywhere"). `200 { "ok": true }`.
 
-When changing anything in this file or `src/routes/auth.ts`:
+## Dual-role token contract
 
-1. The wire envelopes above stay the same on every non-success path. Do not introduce new error codes.
-2. The "Idempotent on retry?" column of the surface table is the source of truth for the contract. If you add a new endpoint, decide on its row before merging.
-3. `pnpm test`, `pnpm lint`, and `pnpm build` all pass before opening a PR.
-4. If you change any telemetry metric name (`challenge_*`, etc.), grep for the literal name across `src/` and update both code and tests in the same commit.
+`createSession()` issues a single raw token, not a separate session token
+and refresh token. That one token is valid both as a bearer `session_token`
+(for protected routes and `/auth/session/validate`) and as the initial
+`refresh_token` accepted by `/auth/refresh` — `rotateSession` looks the
+presented value up by its hash in the same `sessions` table regardless of
+which field name it arrived under.
+
+After a rotation, the newly issued token from `/auth/refresh` is likewise
+dual-role: it can be used as the next `refresh_token` **or** as a bearer
+`session_token`.
+
+To make this contract discoverable from either endpoint's response alone,
+**both `/auth/verify` and `/auth/refresh` return both field names for the
+same value**:
+
+- `/auth/verify` returns `session_token` (as before) and now also
+  `refresh_token`, equal to it.
+- `/auth/refresh` returns `refresh_token` (as before) and now also
+  `session_token`, equal to it.
+
+This is purely additive — no existing field was removed or renamed, so
+callers relying on only one of the two names continue to work unchanged.
+
+## Refresh-rotation security model
+
+Implemented in `src/auth/session.ts` (`rotateSession` / `revokeFamily`):
+
+- Every session/refresh token belongs to a **family** (`familyId`), assigned
+  when the family's first token is created and preserved across rotations.
+- Calling `/auth/refresh` **consumes** the presented token (marks it
+  `rotatedAt`) and issues a brand-new token in the same family.
+- If a token that has already been rotated (or revoked) is presented again,
+  this is treated as a **token-theft signal**, not just an ordinary invalid
+  token: the entire family is revoked immediately via `revokeFamily`, so
+  even the legitimate, currently-active token in that family stops working.
+  The caller must re-authenticate from `/auth/challenge` to get a new
+  family.
+
+## Known limitations / out of scope
+
+- **Address format is intentionally unvalidated.** All four request schemas
+  (`AddressBody`, `VerifyBody`, `SessionBody`, `RefreshBody`) accept
+  `address` as an opaque `z.string().min(3)` with no Starknet-address/hex
+  format check. This is left as-is to preserve compatibility with existing
+  callers and tests (which use non-address placeholder strings such as
+  `"address"` or `"0xExpiredChallenge"`); tightening it is out of scope for
+  this change.
+- This document and the associated change only tighten the
+  session/refresh-token response contract (making the dual-role token
+  explicit in both endpoints' JSON) and write down the existing
+  single-outstanding-challenge-per-address behavior. No runtime behavior
+  changes; response shapes only gain fields.
