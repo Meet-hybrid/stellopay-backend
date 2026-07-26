@@ -392,4 +392,88 @@ describe("Auth Routes Integration", () => {
       .send({ address, refresh_token: token });
     expect(refreshAfterRevokeRes.status).toBe(401);
   });
+
+  it("session revocation route gates correctly (owner, admin, other)", async () => {
+    const addressOwner = "0xOwnerAddress".toLowerCase();
+    const addressOther = "0xOtherAddress".toLowerCase();
+    const addressAdmin = "0xAdminAddress".toLowerCase();
+    const appInstance = makeApp();
+
+    // Setup: Push admin address to env.ADMIN_ADDRESSES if not present
+    const { env } = await import("../config.js");
+    if (!env.ADMIN_ADDRESSES.includes(addressAdmin)) {
+      env.ADMIN_ADDRESSES.push(addressAdmin);
+    }
+
+    // 1. Create a session for the owner
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address: addressOwner });
+    const verifyOwner = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address: addressOwner, signature: ["0xsig1", "0xsig2"] });
+    const tokenOwner = verifyOwner.body.session_token;
+    const tokenHashOwner = crypto.createHash("sha256").update(tokenOwner).digest("hex");
+
+    // Create a session for other user to authenticate their requests
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address: addressOther });
+    const verifyOther = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address: addressOther, signature: ["0xsig1", "0xsig2"] });
+    const tokenOther = verifyOther.body.session_token;
+
+    // Create a session for the admin to authenticate their requests
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address: addressAdmin });
+    const verifyAdmin = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address: addressAdmin, signature: ["0xsig1", "0xsig2"] });
+    const tokenAdmin = verifyAdmin.body.session_token;
+
+    // A. Attempting to revoke with someone else's token (not admin) should fail (401)
+    const revokeByOther = await request(appInstance)
+      .post("/api/v1/auth/session/revoke")
+      .set("x-user-address", addressOther)
+      .set("Authorization", `Bearer ${tokenOther}`)
+      .send({ token_hash: tokenHashOwner });
+    expect(revokeByOther.status).toBe(401);
+
+    // B. Attempting to revoke non-existent token should return 404
+    const revokeNonExistent = await request(appInstance)
+      .post("/api/v1/auth/session/revoke")
+      .set("x-user-address", addressOwner)
+      .set("Authorization", `Bearer ${tokenOwner}`)
+      .send({ token_hash: "a".repeat(64) });
+    expect(revokeNonExistent.status).toBe(404);
+
+    // C. Owner can revoke their own session
+    const revokeByOwner = await request(appInstance)
+      .post("/api/v1/auth/session/revoke")
+      .set("x-user-address", addressOwner)
+      .set("Authorization", `Bearer ${tokenOwner}`)
+      .send({ token_hash: tokenHashOwner });
+    expect(revokeByOwner.status).toBe(200);
+    expect(revokeByOwner.body.ok).toBe(true);
+
+    // D. Revoked session is rejected immediately by middleware
+    const validateAfterRevoked = await request(appInstance)
+      .post("/api/v1/auth/session/validate")
+      .send({ address: addressOwner, session_token: tokenOwner });
+    expect(validateAfterRevoked.status).toBe(401);
+
+    // E. Admin can revoke anyone's session
+    // Create another session for owner
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address: addressOwner });
+    const verifyOwner2 = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address: addressOwner, signature: ["0xsig1", "0xsig2"] });
+    const tokenOwner2 = verifyOwner2.body.session_token;
+    const tokenHashOwner2 = crypto.createHash("sha256").update(tokenOwner2).digest("hex");
+
+    const revokeByAdmin = await request(appInstance)
+      .post("/api/v1/auth/session/revoke")
+      .set("x-user-address", addressAdmin)
+      .set("Authorization", `Bearer ${tokenAdmin}`)
+      .send({ token_hash: tokenHashOwner2 });
+    expect(revokeByAdmin.status).toBe(200);
+    expect(revokeByAdmin.body.ok).toBe(true);
+  });
 });

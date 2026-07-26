@@ -133,6 +133,8 @@ import {
   rotateSession,
   revokeFamily,
   revokeAllSessionsForAddress,
+  getSessionByHash,
+  revokeSessionByHash,
 } from "./session";
 import {
   getSessionMetricsSnapshot,
@@ -602,5 +604,26 @@ describe("sessions", () => {
     } finally {
       dbMock.insert = originalInsert;
     }
+  });
+
+  it("getSessionByHash retrieves a session by its token hash", async () => {
+    const { token } = await createSession("0xGetHash");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const session = await getSessionByHash(tokenHash);
+    expect(session).not.toBeNull();
+    expect(session!.address).toBe("0xgethash");
+  });
+
+  it("getSessionByHash returns null for non-existent token hash", async () => {
+    const session = await getSessionByHash("non-existent-hash");
+    expect(session).toBeNull();
+  });
+
+  it("revokeSessionByHash marks a session as revoked", async () => {
+    const { token } = await createSession("0xRevokeHash");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    await revokeSessionByHash(tokenHash);
+    const session = await getSessionByHash(tokenHash);
+    expect(session!.revokedAt).toBeInstanceOf(Date);
   });
 });
