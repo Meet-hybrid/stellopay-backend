@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { setupGracefulShutdown } from "./shutdown.js";
-import { Server } from "http";
+import { createServer, request, Server, type AddressInfo } from "http";
 
 describe("Graceful Shutdown", () => {
   let mockServer: any;
@@ -41,13 +41,14 @@ describe("Graceful Shutdown", () => {
     const handler = sigtermHandlerCall[1];
 
     // Trigger the signal
-    handler("SIGTERM");
+    const shutdownPromise = handler("SIGTERM");
 
     // Server close should be called
     expect(mockServer.close).toHaveBeenCalled();
 
     // Call the callback to simulate server fully closed
     await mockServer._closeCallback();
+    await shutdownPromise;
 
     // Pool should be closed
     expect(mockClosePool).toHaveBeenCalled();
@@ -141,15 +142,135 @@ describe("Graceful Shutdown", () => {
     const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
     const handler = sigtermHandlerCall[1];
 
-    handler("SIGTERM");
+    const shutdownPromise = handler("SIGTERM");
 
     // Call the callback to simulate server closed
     await mockServer._closeCallback();
+    await shutdownPromise;
 
     // Pool should be called
     expect(mockClosePool).toHaveBeenCalled();
 
     // Should exit with 1 due to error
     expect(processExitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("should close the HTTP server before closing the pool", async () => {
+    const callOrder: string[] = [];
+    mockServer.close = vi.fn((cb) => {
+      callOrder.push("server.close");
+      mockServer._closeCallback = cb;
+    });
+    mockClosePool.mockImplementation(async () => {
+      callOrder.push("pool.close");
+    });
+
+    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    const shutdownPromise = handler("SIGTERM");
+    await mockServer._closeCallback();
+    await shutdownPromise;
+
+    expect(callOrder).toEqual(["server.close", "pool.close"]);
+  });
+});
+
+describe("Graceful Shutdown HTTP integration", () => {
+  let server: Server;
+  let closePool: ReturnType<typeof vi.fn>;
+  let processExitSpy: ReturnType<typeof vi.spyOn>;
+  let port: number;
+
+  beforeEach(() => {
+    closePool = vi.fn().mockResolvedValue(undefined);
+    processExitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+  });
+
+  afterEach(async () => {
+    process.removeAllListeners("SIGTERM");
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("unhandledRejection");
+    process.removeAllListeners("uncaughtException");
+    if (server?.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    vi.restoreAllMocks();
+  });
+
+  async function listenHttpServer(httpServer: Server): Promise<number> {
+    return new Promise((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(0, "127.0.0.1", () => {
+        const address = httpServer.address() as AddressInfo;
+        resolve(address.port);
+      });
+    });
+  }
+
+  function emitSigterm(): void {
+    for (const listener of process.listeners("SIGTERM")) {
+      if (typeof listener === "function") {
+        listener("SIGTERM");
+        return;
+      }
+    }
+    throw new Error("SIGTERM handler not registered");
+  }
+
+  it("completes in-flight requests and refuses new connections during drain", async () => {
+    let slowRequestSeen = false;
+    let releaseSlowResponse!: () => void;
+    const slowResponseGate = new Promise<void>((resolve) => {
+      releaseSlowResponse = resolve;
+    });
+
+    server = createServer((req, res) => {
+      if (req.url === "/slow") {
+        slowRequestSeen = true;
+        void slowResponseGate.then(() => {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("slow-ok");
+        });
+        return;
+      }
+      res.writeHead(200);
+      res.end("ok");
+    });
+
+    port = await listenHttpServer(server);
+    setupGracefulShutdown(server, closePool, 10_000);
+
+    const inFlightBody = new Promise<string>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port, path: "/slow", method: "GET" }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(chunk as Buffer));
+        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    await vi.waitFor(() => {
+      expect(slowRequestSeen).toBe(true);
+    });
+
+    emitSigterm();
+
+    const refusedError = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      const req = request({ host: "127.0.0.1", port, path: "/", method: "GET" }, () => resolve(null));
+      req.on("error", (err) => resolve(err));
+      req.end();
+    });
+    expect(refusedError?.code).toBe("ECONNREFUSED");
+
+    releaseSlowResponse();
+    expect(await inFlightBody).toBe("slow-ok");
+    await vi.waitFor(() => {
+      expect(closePool).toHaveBeenCalled();
+      expect(processExitSpy).toHaveBeenCalledWith(0);
+    });
   });
 });

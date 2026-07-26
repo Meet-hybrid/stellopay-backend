@@ -27,6 +27,7 @@ export default defineConfig({
         "src/middleware/rate-limit.ts",
         "src/routes/token.ts",
         "src/utils/token-formatting.ts",
+        "src/shutdown.ts",
       ],
       thresholds: {
         lines: 95,
