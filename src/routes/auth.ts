@@ -10,6 +10,7 @@ import {
   revokeAllSessionsForAddress,
 } from "../auth/session.js";
 import { requireAuth } from "../auth/middleware.js";
+import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
 const AddressBody = z.object({ address: z.string().min(3) });
 const VerifyBody = z.object({
@@ -64,6 +65,12 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
+    
+    if (isLockedOut(address)) {
+      res.status(401).json({ error: "Invalid signature or account locked" });
+      return;
+    }
+
     // Consume (read + delete) the challenge atomically, before the async verify call,
     // so two concurrent requests can't both read it while it's still valid and both
     // pass verification off the same nonce.
@@ -80,9 +87,12 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
     if (!ok) {
-      res.status(401).json({ error: "Invalid signature" });
+      recordFailure(address);
+      res.status(401).json({ error: "Invalid signature or account locked" });
       return;
     }
+    
+    clearFailures(address);
     const session = await createSession(address);
     res.json({
       ok: true,

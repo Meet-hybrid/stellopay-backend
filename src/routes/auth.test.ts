@@ -110,7 +110,8 @@ vi.mock("../starknet/client.js", () => ({
   getCachedNetworkInfo: vi.fn().mockResolvedValue({ chainId: "0x534e5f5345504f4c4941" }),
 }));
 
-import { authRouter } from "./auth";
+import { authRouter } from "./auth.js";
+import { lockouts } from "../auth/lockout.js";
 
 function makeApp() {
   const app = express();
@@ -128,6 +129,7 @@ describe("Auth Routes Integration", () => {
     vi.setSystemTime(0);
     mockState.sessions = [];
     vi.clearAllMocks();
+    lockouts.clear();
   });
 
   afterEach(() => {
@@ -391,5 +393,64 @@ describe("Auth Routes Integration", () => {
       .post("/api/v1/auth/refresh")
       .send({ address, refresh_token: token });
     expect(refreshAfterRevokeRes.status).toBe(401);
+  it("locks out an account after 5 consecutive failed logins, and successful login resets it", async () => {
+    const address = "0xLockoutTest";
+    const appInstance = makeApp();
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(false);
+
+    // Generate 5 failed attempts
+    for (let i = 0; i < 5; i++) {
+      const challengeRes = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address });
+      
+      const verifyRes = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xbad", "0xbad"] });
+
+      expect(verifyRes.status).toBe(401);
+      expect(verifyRes.body.error).toBe("Invalid signature or account locked");
+    }
+
+    // 6th attempt should fail immediately without calling provider
+    mockProvider.verifyMessageInStarknet.mockClear();
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    const lockedRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xgood", "0xgood"] });
+      
+    expect(lockedRes.status).toBe(401);
+    expect(lockedRes.body.error).toBe("Invalid signature or account locked");
+    expect(mockProvider.verifyMessageInStarknet).not.toHaveBeenCalled();
+
+    // Fast forward 15 minutes
+    vi.advanceTimersByTime(15 * 60 * 1000 + 1);
+
+    // Now it should succeed
+    const validVerifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xgood", "0xgood"] });
+    
+    expect(validVerifyRes.status).toBe(200);
+    expect(validVerifyRes.body.ok).toBe(true);
+
+    // Verify counter is reset by trying one bad password (should not lock)
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(false);
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    const singleBad = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xbad", "0xbad"] });
+    expect(singleBad.status).toBe(401);
+    
+    // Followed by a good one (should succeed since we are at 1 failure)
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    const singleGood = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xgood", "0xgood"] });
+    expect(singleGood.status).toBe(200);
   });
 });
