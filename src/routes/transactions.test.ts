@@ -247,18 +247,17 @@ describe("Transactions Router Logging", () => {
   });
 });
 
-describe("Transaction Export Contracts", () => {
+describe("Transaction Export Contracts - Edge Cases", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("should match the backward-compatible TransactionRecord shape on success", async () => {
+  it("should enforce exactly the TransactionRecord shape when returning mock results", async () => {
     const res = await request(app).get(
       "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=1"
     );
     expect(res.status).toBe(200);
     const exportData = res.body;
-    
     expect(exportData).toHaveProperty("total");
     expect(exportData).toHaveProperty("hasMore");
     expect(exportData).toHaveProperty("limit");
@@ -295,9 +294,7 @@ describe("Transaction Export Contracts", () => {
     vi.mocked(db.select).mockImplementationOnce(() => {
       throw new Error("Database connection lost");
     });
-    
     const res = await request(app).get("/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4");
-    
     expect(res.status).toBe(500);
     expect(res.body.error).toBe("Database connection lost");
   });
