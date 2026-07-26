@@ -28,6 +28,7 @@ export default defineConfig({
         "src/routes/token.ts",
         "src/routes/not-found.ts",
         "src/utils/token-formatting.ts",
+        "src/utils/validation.ts",
         "src/shutdown.ts",
       ],
       thresholds: {
