@@ -22,6 +22,33 @@ export const transactionsRouter = Router();
  *
  * @param args - Values forwarded to console.debug when debug logging is on.
  */
+
+/** Structured metrics for transaction endpoint diagnostics. */
+interface TxRequestMetrics {
+  route: string;
+  userAddress: string;
+  durationMs: number;
+  totalResults: number;
+  paymentsCount: number;
+  escrowCount: number;
+  agreementEventsCount: number;
+  employeeCount: number;
+  milestoneCount: number;
+  tokenFetchDurationMs: number;
+  error?: string;
+  correlationId: string;
+}
+
+function logTxMetrics(metrics: TxRequestMetrics): void {
+  const level = metrics.error ? "error" : "info";
+  console[level](
+    `[transactions:metrics] ${JSON.stringify({
+      ...metrics,
+      timestamp: new Date().toISOString(),
+    })}`,
+  );
+}
+
 function debugLog(...args: unknown[]): void {
   if (env.LOG_LEVEL === "debug") {
     console.debug(...args);
@@ -984,3 +1011,4 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
     next(e);
   }
 });
+
