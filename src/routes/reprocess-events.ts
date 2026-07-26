@@ -154,7 +154,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
         return;
       }
       next(e);
@@ -328,7 +328,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
