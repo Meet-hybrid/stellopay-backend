@@ -81,8 +81,27 @@ interface TransactionFilters {
 
 export const transactionsRouter = Router();
 
-// ── Logging ──────────────────────────────────────────────────────────────
+export interface TransactionRecord {
+  id: string;
+  type: string;
+  address: string;
+  date: string;
+  time: string;
+  token: string;
+  amount: string;
+  status: "Completed";
+  tokenIcon: string;
+  txHash: string;
+  createdAt: Date;
+}
 
+export interface TransactionExport {
+  transactions: TransactionRecord[];
+  total: number;
+  hasMore: boolean;
+  limit: number;
+  offset: number;
+}
 /**
  * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
  * to "debug". These lines are noisy on the request hot path and can include
@@ -843,29 +862,30 @@ async function fetchAndBuildTransactions(
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
 
-      return {
-        id: p.transactionHash.slice(0, 10),
-        type:
-          p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
-        address: formatAddress(isReceived ? p.from : p.to),
-        date: dateTime.date,
-        time: dateTime.time,
-        token: tokenInfo.name,
-        amount: finalAmount,
-        status: "Completed" as const,
-        tokenIcon: tokenInfo.icon,
-        txHash: p.transactionHash,
-        createdAt: p.createdAt,
-      };
-    }),
-    ...escrowEvents.map((e) => {
-      const dateTime = formatDate(e.createdAt);
-      const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
-      const tokenInfo = getTokenInfo(tokenAddress);
-      const amountStr = formatAmount(e.amount, tokenInfo);
-      const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
-      const sign = isIncoming ? "+" : "-";
-      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+    const allTransactions: TransactionRecord[] = [
+      ...uniqueAgreementEvents.map((a) => {
+        const dateTime = formatDate(a.createdAt);
+        return {
+          id: a.transactionHash.slice(0, 10),
+          type: formatEventType(a.eventType),
+          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: "-",
+          amount: "-",
+          status: "Completed" as const,
+          tokenIcon: "",
+          txHash: a.transactionHash,
+          createdAt: a.createdAt, // Add for sorting
+        };
+      }),
+      ...payments.map((p) => {
+        const dateTime = formatDate(p.createdAt);
+        const tokenInfo = getTokenInfo(p.token);
+        const amountStr = formatAmount(p.amount, tokenInfo);
+        const isReceived = p.eventType === "PaymentReceived";
+        const sign = isReceived ? "+" : "-";
+        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
 
       return {
         id: e.transactionHash.slice(0, 10),
@@ -1030,5 +1050,285 @@ transactionsRouter.get(
     } catch (e) {
       next(e);
     }
-  },
-);
+
+    const employeeConditions = [eq(schema.employees.employeeAddress, userAddress)];
+    const milestoneConditions = [
+      or(
+        eq(schema.agreements.employer, userAddress),
+        eq(schema.agreements.contributor, userAddress),
+      ),
+    ];
+
+    if (startDate) {
+      employeeConditions.push(gte(schema.employees.createdAt, startDate));
+      milestoneConditions.push(gte(schema.milestones.createdAt, startDate));
+    }
+    if (endDate) {
+      employeeConditions.push(lte(schema.employees.createdAt, endDate));
+      milestoneConditions.push(lte(schema.milestones.createdAt, endDate));
+    }
+
+    const [paymentsCount, escrowCount, agreementEventsCount, employeesCount, milestonesCount] =
+      await Promise.all([
+        db
+          .select({ count: count() })
+          .from(schema.payments)
+          .where(and(...paymentConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.escrowEvents)
+          .where(and(...escrowConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.agreementEvents)
+          .innerJoin(
+            schema.agreements,
+            eq(schema.agreementEvents.agreementId, schema.agreements.id),
+          )
+          .where(and(...agreementEventConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.employees)
+          .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
+          .where(and(...employeeConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.milestones)
+          .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
+          .where(and(...milestoneConditions)),
+      ]);
+
+    const total =
+      Number(paymentsCount[0].count) +
+      Number(escrowCount[0].count) +
+      Number(agreementEventsCount[0].count) +
+      Number(employeesCount[0].count) +
+      Number(milestonesCount[0].count);
+
+    const [payments, escrowEvents, employeeEventsData, milestoneEventsData] = await Promise.all([
+      db
+        .select()
+        .from(schema.payments)
+        .where(and(...paymentConditions))
+        .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id))
+        .limit(queryLimit),
+      db
+        .select()
+        .from(schema.escrowEvents)
+        .where(and(...escrowConditions))
+        .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id))
+        .limit(queryLimit),
+      db
+        .select({
+          id: schema.employees.id,
+          agreementId: schema.employees.agreementId,
+          contractAddress: schema.employees.contractAddress,
+          blockNumber: schema.employees.blockNumber,
+          transactionHash: schema.employees.transactionHash,
+          createdAt: schema.employees.createdAt,
+          employer: schema.agreements.employer,
+          contributor: schema.agreements.contributor,
+          token: schema.agreements.token,
+          employeeAddress: schema.employees.employeeAddress,
+          amount: schema.employees.salaryPerPeriod,
+        })
+        .from(schema.employees)
+        .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
+        .where(and(...employeeConditions))
+        .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id))
+        .limit(queryLimit),
+      db
+        .select({
+          id: schema.milestones.id,
+          agreementId: schema.milestones.agreementId,
+          contractAddress: schema.milestones.contractAddress,
+          blockNumber: schema.milestones.blockNumber,
+          transactionHash: schema.milestones.transactionHash,
+          createdAt: schema.milestones.createdAt,
+          employer: schema.agreements.employer,
+          contributor: schema.agreements.contributor,
+          token: schema.agreements.token,
+          amount: schema.milestones.amount,
+        })
+        .from(schema.milestones)
+        .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
+        .where(and(...milestoneConditions))
+        .orderBy(desc(schema.milestones.createdAt), desc(schema.milestones.id))
+        .limit(queryLimit),
+    ]);
+
+    const employeeEvents = employeeEventsData.map((e) => ({
+      ...e,
+      eventType: "EmployeeAdded" as const,
+    }));
+    const milestoneEvents = milestoneEventsData.map((m) => ({
+      ...m,
+      eventType: "MilestoneAdded" as const,
+    }));
+
+    const escrowAgreementIds = [...new Set(escrowEvents.map((e) => e.agreementId))];
+
+    const escrowAgreements =
+      escrowAgreementIds.length > 0
+        ? await db
+            .select({
+              id: schema.agreements.id,
+              token: schema.agreements.token,
+              contractAddress: schema.agreements.contractAddress,
+            })
+            .from(schema.agreements)
+            .where(inArray(schema.agreements.id, escrowAgreementIds))
+        : [];
+
+    const agreementsForTokenFetch = escrowAgreements
+      .filter((a) => a.contractAddress)
+      .map((a) => ({
+        agreementContractAddress: a.contractAddress!,
+        agreementId: a.id,
+      }));
+
+    const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
+
+    const escrowTokenMap = new Map<string, string>();
+    for (const agreement of escrowAgreements) {
+      const contractToken = contractTokenMap.get(agreement.id);
+      const dbToken = agreement.token;
+      const finalToken = contractToken || dbToken;
+      escrowTokenMap.set(agreement.id, finalToken);
+    }
+
+    const agreementEvents = await db
+      .select({
+        id: schema.agreementEvents.id,
+        agreementId: schema.agreementEvents.agreementId,
+        contractAddress: schema.agreementEvents.contractAddress,
+        eventType: schema.agreementEvents.eventType,
+        blockNumber: schema.agreementEvents.blockNumber,
+        transactionHash: schema.agreementEvents.transactionHash,
+        createdAt: schema.agreementEvents.createdAt,
+        employer: schema.agreements.employer,
+        contributor: schema.agreements.contributor,
+        token: schema.agreements.token,
+      })
+      .from(schema.agreementEvents)
+      .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
+      .where(and(...agreementEventConditions))
+      .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
+      .limit(queryLimit);
+
+    const allTransactions: TransactionRecord[] = [
+      ...agreementEvents.map((a) => {
+        const dateTime = formatDate(a.createdAt);
+        return {
+          id: a.transactionHash.slice(0, 10),
+          type: formatEventType(a.eventType),
+          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: "-",
+          amount: "-",
+          status: "Completed" as const,
+          tokenIcon: "",
+          txHash: a.transactionHash,
+          createdAt: a.createdAt,
+        };
+      }),
+      ...payments.map((p) => {
+        const dateTime = formatDate(p.createdAt);
+        const tokenInfo = getTokenInfo(p.token);
+        const amountStr = formatAmount(p.amount, tokenInfo);
+        const isReceived = p.eventType === "PaymentReceived";
+        const sign = isReceived ? "+" : "-";
+        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
+        return {
+          id: p.transactionHash.slice(0, 10),
+          type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
+          address: formatAddress(isReceived ? p.from : p.to),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: tokenInfo.name,
+          amount: finalAmount,
+          status: "Completed" as const,
+          tokenIcon: tokenInfo.icon,
+          txHash: p.transactionHash,
+          createdAt: p.createdAt,
+        };
+      }),
+      ...escrowEvents.map((e) => {
+        const dateTime = formatDate(e.createdAt);
+        const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
+        const tokenInfo = getTokenInfo(tokenAddress);
+        const amountStr = formatAmount(e.amount, tokenInfo);
+        const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
+        const sign = isIncoming ? "+" : "-";
+        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
+        return {
+          id: e.transactionHash.slice(0, 10),
+          type:
+            e.eventType === "Funded"
+              ? "Agreement Funded"
+              : e.eventType === "Released"
+                ? "Payment Released"
+                : "Refund Received",
+          address: formatAddress(e.eventType === "Funded" ? e.employer : e.to || ""),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: tokenInfo.name,
+          amount: finalAmount,
+          status: "Completed" as const,
+          tokenIcon: tokenInfo.icon,
+          txHash: e.transactionHash,
+          createdAt: e.createdAt,
+        };
+      }),
+      ...employeeEvents.map((e) => {
+        const dateTime = formatDate(e.createdAt);
+        const addressToFormat = e.employer === userAddress ? e.employeeAddress : e.employer;
+        return {
+          id: e.transactionHash.slice(0, 10),
+          type: "Employee Added",
+          address: formatAddress(addressToFormat || ""),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: "-",
+          amount: "-",
+          status: "Completed" as const,
+          tokenIcon: "",
+          txHash: e.transactionHash,
+          createdAt: e.createdAt,
+        };
+      }),
+      ...milestoneEvents.map((m) => {
+        const dateTime = formatDate(m.createdAt);
+        const addressToFormat = m.employer === userAddress ? m.contributor || "N/A" : m.employer;
+        return {
+          id: m.transactionHash.slice(0, 10),
+          type: "Milestone Added",
+          address: formatAddress(addressToFormat || ""),
+          date: dateTime.date,
+          time: dateTime.time,
+          token: "-",
+          amount: "-",
+          status: "Completed" as const,
+          tokenIcon: "",
+          txHash: m.transactionHash,
+          createdAt: m.createdAt,
+        };
+      }),
+    ].sort((a, b) => {
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (timeB !== timeA) return timeB - timeA;
+      return a.txHash.localeCompare(b.txHash);
+    });
+
+    const paginatedTransactions = allTransactions.slice(offset, offset + limit);
+    const hasMore = total > offset + limit;
+
+    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
+  } catch (e) {
+    next(e);
+  }
+});

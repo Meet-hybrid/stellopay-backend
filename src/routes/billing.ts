@@ -67,6 +67,148 @@ function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
 }
 
+const BILLING_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+type BillingIdempotencyEntry = {
+  createdAt: number;
+  expiresAt: number;
+  bodyFingerprint: string;
+  statusCode: number;
+  responseBody: unknown;
+};
+
+// NOTE: Billing idempotency is currently backed by an in-process TTL cache.
+// If this service is scaled horizontally, this should be moved to a shared store.
+const billingIdempotencyStore = new Map<string, BillingIdempotencyEntry>();
+
+function stableSerialize(value: unknown): string {
+  if (typeof value === "undefined") return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`).join(",")}}`;
+  }
+  return String(value);
+}
+
+function getHeader(req: Request, name: string): string | undefined {
+  const value = req.get(name);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function resolveBillingAccountScope(req: Request): string {
+  for (const headerName of ["x-user-address", "x-account-id", "x-user-id"]) {
+    const value = getHeader(req, headerName);
+    if (value) return value;
+  }
+  return req.ip ?? "anonymous";
+}
+
+function getBillingIdempotencyCacheKey(req: Request, idempotencyKey: string): string {
+  const accountScope = resolveBillingAccountScope(req);
+  const routeKey = req.originalUrl || req.path || "/";
+  const profileId = typeof req.params?.profileId === "string" ? req.params.profileId : "";
+  return `billing:${accountScope}:${req.method}:${routeKey}:${profileId}:${idempotencyKey}`;
+}
+
+function pruneExpiredEntries(now = Date.now()): void {
+  for (const [cacheKey, entry] of billingIdempotencyStore.entries()) {
+    if (entry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+  }
+}
+
+export function clearBillingIdempotencyStore(): void {
+  billingIdempotencyStore.clear();
+}
+
+/**
+ * Wrap a mutating billing handler with idempotency support.
+ *
+ * When an Idempotency-Key header is present, the first successful response for
+ * that account/route/body combination is cached for 24 hours. Replays with the
+ * same key and body return the cached response; replays with the same key but a
+ * different body are rejected with 409 Conflict.
+ */
+export function withBillingIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey = getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const method = req.method.toUpperCase();
+
+    if (!idempotencyKey || ["GET", "HEAD", "OPTIONS"].includes(method)) {
+      await handler(req, res, next);
+      return;
+    }
+
+    const now = Date.now();
+    pruneExpiredEntries(now);
+
+    const cacheKey = getBillingIdempotencyCacheKey(req, idempotencyKey);
+    const existingEntry = billingIdempotencyStore.get(cacheKey);
+
+    if (existingEntry && existingEntry.expiresAt > now) {
+      if (existingEntry.bodyFingerprint !== stableSerialize(req.body)) {
+        fail(res, 409, "Idempotency key already used with a different request body");
+        return;
+      }
+
+      res.status(existingEntry.statusCode).json(existingEntry.responseBody);
+      return;
+    }
+
+    if (existingEntry && existingEntry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    let cachedResponse: BillingIdempotencyEntry | undefined;
+
+    const persistResponse = (body: unknown): void => {
+      if (cachedResponse) {
+        return;
+      }
+      cachedResponse = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + BILLING_IDEMPOTENCY_TTL_MS,
+        bodyFingerprint: stableSerialize(req.body),
+        statusCode: res.statusCode,
+        responseBody: body,
+      };
+      billingIdempotencyStore.set(cacheKey, cachedResponse);
+    };
+
+    res.json = ((body: unknown) => {
+      persistResponse(body);
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.send = ((body: unknown) => {
+      if (!cachedResponse) {
+        persistResponse(body);
+      }
+      return originalSend(body);
+    }) as typeof res.send;
+
+    try {
+      await handler(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
 /** Zod schema for the :profileId path param – non-empty string, max 128 chars */
 const profileIdSchema = z.object({
   profileId: z
@@ -132,6 +274,18 @@ async function requireBillingOwner(
 // billing route.  validateProfileId must run first so res.locals.profileId is
 // available for the ownership lookup.
 billingRouter.use("/billing", requireBillingEnabled, requireAuth);
+
+// Mutating billing routes can opt into request replay protection via Idempotency-Key.
+billingRouter.use("/billing", (req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method.toUpperCase())) {
+    next();
+    return;
+  }
+
+  withBillingIdempotency(async (_req, _res, _next) => {
+    next();
+  })(req, res, next);
+});
 
 // ---------------------------------------------------------------------------
 // Strip sensitive fields before returning a profile row to the client.
