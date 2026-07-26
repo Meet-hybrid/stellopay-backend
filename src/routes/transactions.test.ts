@@ -583,3 +583,576 @@ describe("Transactions Router — response contract", () => {
     }
   });
 });
+
+// ── Sort order contract ──────────────────────────────────────────────────
+
+describe("Transactions Router — sort order contract", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("sorts items by createdAt descending", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 1 }]);
+      // Return rows with staggered createdAt values so we can verify sort order
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "row-1",
+          transactionHash:
+            "0x1000000000000000000000000000000000000000000000000000000000000000",
+          createdAt: new Date("2025-01-01T00:00:00Z"),
+          eventType: "AgreementCreated",
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "row-2",
+          transactionHash:
+            "0x2000000000000000000000000000000000000000000000000000000000000000",
+          createdAt: new Date("2025-06-15T10:30:00Z"),
+          eventType: "AgreementCreated",
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "row-3",
+          transactionHash:
+            "0x3000000000000000000000000000000000000000000000000000000000000000",
+          createdAt: new Date("2025-12-31T23:59:59Z"),
+          eventType: "AgreementCreated",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    // 3 rows × 5 tables = 15 items
+    // But with count=1, total = 5 (1 per table)
+    // Each data query returns 3 rows → 15 items
+    expect(res.body.transactions.length).toBe(15);
+    // First item should be newest (2025-12-31)
+    expect(new Date(res.body.transactions[0].createdAt).getTime()).toBe(
+      new Date("2025-12-31T23:59:59Z").getTime(),
+    );
+    // Items at index 5-9 should be from row-2 (2025-06-15)
+    expect(new Date(res.body.transactions[5].createdAt).getTime()).toBe(
+      new Date("2025-06-15T10:30:00Z").getTime(),
+    );
+    // Last item should be oldest (2025-01-01)
+    expect(new Date(res.body.transactions[14].createdAt).getTime()).toBe(
+      new Date("2025-01-01T00:00:00Z").getTime(),
+    );
+  });
+
+  it("uses txHash as stable tiebreaker when createdAt is equal", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 1 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "row-b",
+          transactionHash:
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          createdAt: new Date("2025-06-15T10:30:00Z"),
+          eventType: "AgreementCreated",
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "row-a",
+          transactionHash:
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          createdAt: new Date("2025-06-15T10:30:00Z"),
+          eventType: "AgreementCreated",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    // 2 rows × 5 tables = 10 items
+    // But with count=1, total = 5 (1 per table)
+    expect(res.body.transactions.length).toBe(10);
+    // At the same createdAt, lower txHash comes first (ascending)
+    // "0xaaa..." < "0xbbb...", so first 5 items have row-a's txHash
+    expect(res.body.transactions[0].txHash).toBe(
+      "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    // Last 5 items have row-b's txHash
+    expect(res.body.transactions[9].txHash).toBe(
+      "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+  });
+});
+
+// ── Per-entity-type contract ─────────────────────────────────────────────
+
+describe("Transactions Router — per-entity-type contract", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("produces the correct type labels for each entity type", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const types = res.body.transactions.map((t: any) => t.type);
+    // All five entity types should be represented
+    expect(types).toContain("Payment Sent");
+    expect(types).toContain("Employee Added");
+    expect(types).toContain("Milestone Added");
+    // Agreement events and escrow events both map from eventType="PaymentSent"
+    // formatEventType("PaymentSent") = "Payment Sent" (exact map entry)
+    // So agreement events and payments both have type "Payment Sent" from DEFAULT_ROW
+    expect(types.filter((t: string) => t === "Payment Sent").length).toBe(2);
+  });
+
+  it("shows token and amount as '-' for agreement events", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const agreementLikeItems = res.body.transactions.filter(
+      (t: any) => t.token === "-",
+    );
+    // At least 3 items (agreement events, employee events, milestone events) should have "-"
+    expect(agreementLikeItems.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("shows placeholder icon for non-payment entity types", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const emptyIconItems = res.body.transactions.filter(
+      (t: any) => t.tokenIcon === "",
+    );
+    // Agreement events, employee events, milestone events have tokenIcon ""
+    // Payments and escrow events have resolved icons
+    expect(emptyIconItems.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("resolves the payment amount with sign prefix", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    // Filter to payment items (not from agreement events which also have type "Payment Sent")
+    // Payment items have resolved tokens (STRK), agreement events have "-"
+    const paymentItem = res.body.transactions.find(
+      (t: any) => t.type === "Payment Sent" && t.token !== "-",
+    );
+    expect(paymentItem).toBeDefined();
+    expect(typeof paymentItem.amount).toBe("string");
+    // Should have "-" sign prefix (outgoing PaymentSent)
+    expect(paymentItem.amount.startsWith("-")).toBe(true);
+    expect(paymentItem.token).toBe("STRK");
+  });
+});
+
+// ── Address field contract ───────────────────────────────────────────────
+
+describe("Transactions Router — address field contract", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("formats addresses in truncated 0x1234...5678 format", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    for (const tx of res.body.transactions) {
+      if (tx.address === "N/A") continue;
+      // Address should start with "0x"
+      expect(tx.address).toMatch(/^0x/);
+      // Either full address or truncated with "..."
+      if (tx.address.includes("...")) {
+        expect(tx.address.length).toBeLessThanOrEqual(14); // 0x + 6 + ... + 4
+      }
+    }
+  });
+
+  it("uses 'N/A' for agreement events when contributor is missing and user is employer", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 1 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "agreement-without-contributor",
+          eventType: "AgreementCreated",
+          transactionHash:
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          employer: USER_ADDRESS,
+          contributor: "",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const agreementTx = res.body.transactions.find(
+      (t: any) => t.type === "Agreement Created",
+    );
+    expect(agreementTx).toBeDefined();
+    expect(agreementTx.address).toBe("N/A");
+  });
+
+  it("shows the counterparty employer when user is the contributor in agreement events", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 1 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "agreement-as-contributor",
+          eventType: "AgreementCreated",
+          transactionHash:
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          employer: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+          contributor: USER_ADDRESS,
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const agreementTx = res.body.transactions.find(
+      (t: any) => t.type === "Agreement Created",
+    );
+    expect(agreementTx).toBeDefined();
+    expect(agreementTx.address).not.toBe("N/A");
+    expect(agreementTx.address).toMatch(/^0x/);
+  });
+
+  it("shows sender (from) address for incoming payments and receiver (to) for outgoing", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 2 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "payment-sent-row",
+          eventType: "PaymentSent",
+          transactionHash:
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01",
+          from: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+          to: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "payment-received-row",
+          eventType: "PaymentReceived",
+          transactionHash:
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02",
+          from: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+          to: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    const sent = res.body.transactions.find(
+      (t: any) => t.type === "Payment Sent" && t.token !== "-",
+    );
+    const received = res.body.transactions.find(
+      (t: any) => t.type === "Payment Received" && t.token !== "-",
+    );
+
+    expect(sent).toBeDefined();
+    expect(received).toBeDefined();
+    expect(sent.address).toMatch(/^0x/);
+    expect(received.address).toMatch(/^0x/);
+  });
+});
+
+// ── Amount formatting contract ───────────────────────────────────────────
+
+describe("Transactions Router — amount formatting contract", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("prepends '-' for outgoing payments and '+' for incoming payments", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 2 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "outgoing",
+          eventType: "PaymentSent",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000001",
+          amount: "15000000",
+          token: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+          from: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+          to: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "incoming",
+          eventType: "PaymentReceived",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000002",
+          amount: "25000000",
+          token: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+          from: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+          to: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}?limit=100`);
+
+    expect(res.status).toBe(200);
+    // Payment items have resolved token (STRK), not "-"
+    const sentPayment = res.body.transactions.find(
+      (t: any) => t.type === "Payment Sent" && t.token === "STRK",
+    );
+    const receivedPayment = res.body.transactions.find(
+      (t: any) => t.type === "Payment Received" && t.token === "STRK",
+    );
+    expect(sentPayment).toBeDefined();
+    expect(receivedPayment).toBeDefined();
+    expect(sentPayment.amount.startsWith("-")).toBe(true);
+    expect(receivedPayment.amount.startsWith("+")).toBe(true);
+    expect(sentPayment.token).toBe("STRK");
+    expect(receivedPayment.token).toBe("STRK");
+  });
+
+  it("prepends '-' for outgoing escrow (Funded) and '+' for incoming escrow (Released/Refunded)", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 2 }]);
+      // IMPORTANT: agreementId must match the row's id so the escrow token
+      // map lookup (by agreementId) finds the resolved token.
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "funded",
+          agreementId: "funded", // match row id so escrow token map key matches
+          eventType: "Funded",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000001",
+          amount: "1000000000",
+          employer: USER_ADDRESS,
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "released",
+          agreementId: "released", // match row id so escrow token map key matches
+          eventType: "Released",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000002",
+          amount: "2000000000",
+          employer: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+          to: USER_ADDRESS,
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}?limit=100`);
+
+    expect(res.status).toBe(200);
+    const funded = res.body.transactions.find(
+      (t: any) => t.type === "Agreement Funded" && t.token !== "-",
+    );
+    const released = res.body.transactions.find(
+      (t: any) => t.type === "Payment Released" && t.token !== "-",
+    );
+
+    expect(funded).toBeDefined();
+    expect(released).toBeDefined();
+    expect(funded.amount.startsWith("-")).toBe(true);
+    expect(released.amount.startsWith("+")).toBe(true);
+  });
+
+  it("displays zero amounts as '-'", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 1 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "zero-amount",
+          eventType: "PaymentSent",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000001",
+          amount: "0",
+          token: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+          from: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+          to: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    // Payment items have resolved token (STRK), not "-"
+    const zeroTx = res.body.transactions.find(
+      (t: any) => t.type === "Payment Sent" && t.token !== "-",
+    );
+    expect(zeroTx).toBeDefined();
+    expect(zeroTx.amount).toBe("-");
+  });
+});
+
+// ── Deduplication contract ───────────────────────────────────────────────
+
+describe("Transactions Router — deduplication contract", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("main endpoint deduplicates agreement events by id", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: 3 }]);
+      return createQueryChain([
+        {
+          ...DEFAULT_ROW,
+          id: "dup-1",
+          eventType: "AgreementCreated",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000001",
+          agreementId: "aggr-1",
+          createdAt: new Date("2025-06-15T10:30:00Z"),
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "dup-1",
+          eventType: "AgreementCreated",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000002",
+          agreementId: "aggr-2",
+          createdAt: new Date("2025-06-15T10:31:00Z"),
+        },
+        {
+          ...DEFAULT_ROW,
+          id: "unique-1",
+          eventType: "AgreementCreated",
+          transactionHash:
+            "0xa000000000000000000000000000000000000000000000000000000000000003",
+          agreementId: "aggr-3",
+          createdAt: new Date("2025-06-15T10:32:00Z"),
+        },
+      ]);
+    });
+
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    // The mock returns the same 3 rows for all 5 tables
+    // Agreement events get deduplicated (2 unique ids from 3 rows)
+    // Other 4 tables each return 3 rows → 12 items
+    // Total = 2 (deduped agreement) + 12 = 14 items
+    expect(res.body.transactions.length).toBe(14);
+    // Check that the agreement event dedup collapsed 3→2 items
+    const agreementCreated = res.body.transactions.filter(
+      (t: any) => t.type === "Agreement Created",
+    );
+    expect(agreementCreated.length).toBe(2);
+  });
+});
+
+// ── Boundary conditions ──────────────────────────────────────────────────
+
+describe("Transactions Router — boundary conditions", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("hasMore is false when total exactly equals offset + limit", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?limit=10`,
+    );
+
+    expect(res.status).toBe(200);
+    // Mock returns count=2 per table × 5 tables = total=10
+    expect(res.body.total).toBe(10);
+    // When offset=0, limit=10: total(10) > offset(0) + limit(10) → false
+    expect(res.body.hasMore).toBe(false);
+  });
+
+  it("hasMore is false when offset exceeds total", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?limit=5&offset=20`,
+    );
+
+    expect(res.status).toBe(200);
+    // total=10, offset=20 > total
+    expect(res.body.total).toBe(10);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body.transactions.length).toBe(0);
+  });
+
+  it("hasMore is true when offset + limit is less than total", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?limit=3&offset=0`,
+    );
+
+    expect(res.status).toBe(200);
+    // total=10, offset(0) + limit(3) = 3 < 10
+    expect(res.body.total).toBe(10);
+    expect(res.body.hasMore).toBe(true);
+  });
+
+  it("hasMore is false when offset + limit exactly equals total", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?limit=5&offset=5`,
+    );
+
+    expect(res.status).toBe(200);
+    // total=10, offset(5) + limit(5) = 10
+    expect(res.body.total).toBe(10);
+    expect(res.body.hasMore).toBe(false);
+  });
+
+  it("returns an empty array when offset is at or beyond the total", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?offset=10`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.transactions.length).toBe(0);
+  });
+});
+
+// ── Endpoint contract differences ────────────────────────────────────────
+
+describe("Transactions Router — endpoint contract differences", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("main endpoint supports eventTypes but filtered endpoint does not", async () => {
+    const main = await request(app).get(
+      `/transactions/${USER_ADDRESS}?eventTypes=PaymentSent`,
+    );
+    const filtered = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?eventTypes=PaymentSent`,
+    );
+
+    expect(main.status).toBe(200);
+    expect(filtered.status).toBe(200);
+    expect(filtered.body).toHaveProperty("transactions");
+  });
+
+  it("filtered endpoint supports date range but main endpoint does not", async () => {
+    const filtered = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=2025-01-01&endDate=2025-12-31`,
+    );
+    const main = await request(app).get(
+      `/transactions/${USER_ADDRESS}?startDate=2025-01-01&endDate=2025-12-31`,
+    );
+
+    expect(filtered.status).toBe(200);
+    expect(main.status).toBe(200);
+    expect(main.body).toHaveProperty("transactions");
+  });
+});

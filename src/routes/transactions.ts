@@ -1,3 +1,29 @@
+/**
+ * Transactions routes — unified, paginated transaction feed.
+ *
+ * ## Merge strategy
+ * The module fetches `queryLimit` rows from each of five entity tables
+ * (payments, escrow events, agreement events, employees, milestones) in
+ * parallel, merges them in application code, sorts by `createdAt` desc +
+ * `txHash` for stable tie-breaking, then slices for the requested page.
+ * This guarantees each entity type is represented in the merged feed.
+ *
+ * ## Address field contract
+ * The `address` field in every `TransactionItem` represents the **other
+ * party** involved in the event, relative to the requesting user. The
+ * resolution logic differs per entity type and is documented inline in
+ * the `fetchAndBuildTransactions` merge section.
+ *
+ * ## Deduplication
+ * The main endpoint passes `{ deduplicateAgreementEvents: true }` so that
+ * agreement events with duplicate `id` values are collapsed to one row.
+ * The filtered endpoint does not deduplicate.
+ *
+ * ## Employee condition mode
+ * The main endpoint matches employees where the user is **either** the
+ * employer or the employee. The filtered endpoint restricts to rows where
+ * the user **is** the employee (`employee-only`).
+ */
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
@@ -14,7 +40,13 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-/** Shape of each transaction item in the API response. */
+/**
+ * Shape of each transaction item in the API response.
+ *
+ * Every field is guaranteed present (never `undefined`), though some may hold
+ * placeholder values (`"-"` for token/amount, `""` for tokenIcon) when the
+ * information is not available for a given entity type.
+ */
 interface TransactionItem {
   id: string;
   type: string;
@@ -67,7 +99,13 @@ function debugLog(...args: unknown[]): void {
 
 // ── Address formatting ────────────────────────────────────────────────────
 
-/** Truncates an address for display (e.g. 0x1234...5678). */
+/**
+ * Truncates a Starknet address for display (e.g. `0x1234...5678`).
+ *
+ * - Returns the original value unchanged when it is falsy or `"N/A"`.
+ * - If the normalized address is 10 characters or shorter, returns it whole.
+ * - Otherwise returns the `0x` prefix + first 6 hex chars + `...` + last 4 hex chars.
+ */
 function formatAddress(addr: string): string {
   if (!addr || addr === "N/A") return addr;
   const normalized = normalizeAddr(addr);
@@ -122,7 +160,15 @@ function getTokenInfo(tokenAddress: string | null | undefined): TokenInfo {
   return tokenInfo;
 }
 
-/** Formats an on-chain token amount for human display. */
+/**
+ * Formats an on-chain token amount for human display.
+ *
+ * Contract:
+ * - Zero, empty, or falsy amounts always return `"-"`.
+ * - STRK amounts are rendered as `"<whole>.<6-fraction-digits> STRK"`.
+ * - Non-STRK amounts (USDC/USDT) are rendered as `"$<whole>.<2-fraction-digits>"`.
+ * - The caller adds a `+` or `-` sign prefix for incoming/outgoing context.
+ */
 function formatAmount(amount: string | bigint, tokenInfo: TokenInfo): string {
   if (!amount || amount === "0" || amount === BigInt(0)) {
     debugLog(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
@@ -278,7 +324,12 @@ async function batchGetTokensFromAgreementContracts(
 
 // ── Date formatting ──────────────────────────────────────────────────────
 
-/** Formats a Date into separate date and time display strings. */
+/**
+ * Formats a Date into separate date and time display strings.
+ *
+ * Date format: `"Mon DD, YYYY"` (e.g. `"Jun 15, 2025"`).
+ * Time format: `"h:MMAM"` or `"h:MMPM"` (e.g. `"10:30AM"` or `"2:45PM"`).
+ */
 function formatDate(date: Date) {
   const d = new Date(date);
   const months = [
@@ -304,6 +355,9 @@ function formatDate(date: Date) {
 /**
  * Maps internal event-type strings to human-readable labels.
  * This is the single source of truth used by both route handlers.
+ *
+ * For known event types the mapping is explicit; unrecognised values are
+ * converted by splitting on capital letters (e.g. `"SomeEvent"` → `"Some Event"`).
  */
 function formatEventType(eventType: string): string {
   const eventTypeMap: Record<string, string> = {
@@ -336,7 +390,13 @@ function formatEventType(eventType: string): string {
 
 // ── Query parameter parsing ──────────────────────────────────────────────
 
-/** Parses limit and offset from request query, clamping limit to [1, 100]. */
+/**
+ * Parses limit and offset from the request query, clamping limit to [1, 100].
+ *
+ * - Missing or invalid `limit` defaults to 50.
+ * - Missing or invalid `offset` defaults to 0.
+ * - Requested values > 100 are silently clamped to 100.
+ */
 function parsePagination(req: {
   query: Record<string, unknown>;
 }): { limit: number; offset: number } {
@@ -348,7 +408,12 @@ function parsePagination(req: {
   return { limit, offset };
 }
 
-/** Parses comma-separated eventTypes from the query string. */
+/**
+ * Parses a comma-separated `eventTypes` query parameter into a string array.
+ *
+ * - Returns `null` when the parameter is absent, empty, or whitespace-only.
+ * - Individual values are trimmed; empty segments are discarded.
+ */
 function parseEventTypes(req: {
   query: Record<string, unknown>;
 }): string[] | null {
@@ -386,6 +451,12 @@ function parseDateFilters(req: {
  *
  * Both pass through this builder; callers simply omit the filters they don't
  * support so the behaviour stays identical to the pre-refactor code.
+ *
+ * @param opts.employeeConditionMode
+ *   - `"employer-or-employee"` (default): matches employees where the user is
+ *     the employer OR the employee (used by the main endpoint).
+ *   - `"employee-only"`: matches employees only where the user IS the employee
+ *     (used by the filtered endpoint).
  */
 function buildConditions(
   userAddress: string,
@@ -516,7 +587,46 @@ function buildConditions(
  * from the database and on-chain contracts, then merges, formats, and sorts
  * every row into a unified transaction list.
  *
- * Returns the full sorted array and the total count so the caller can paginate.
+ * ## Merge contract
+ * Each entity type is mapped to a `TransactionItem` with the following
+ * per-type behaviour:
+ *
+ * **Agreement events** — `type` = formatted via `formatEventType()`.
+ * `address` = the counterparty (contributor if user is the employer,
+ * employer otherwise). `token`/`amount`/`tokenIcon` always `"-"`/`-`/`""`.
+ *
+ * **Payments** — `type` = `"Payment Sent"` or `"Payment Received"`.
+ * `address` = the other party (`to` for sent, `from` for received).
+ * `token`/`amount`/`tokenIcon` resolved from the payment's `token` column.
+ * Amount is prefixed with `+` (received) or `-` (sent).
+ *
+ * **Escrow events** — `type` = `"Agreement Funded"`, `"Payment Released"`,
+ * or `"Refund Received"`. `address` = `employer` for Funded, the `to`
+ * address for Released/Refunded. Tokens resolved from the agreement
+ * row (DB fallback + on-chain cache). Amount prefixed with `+` (incoming)
+ * or `-` (outgoing).
+ *
+ * **Employee events** — Synthetic `type` = `"Employee Added"`.
+ * `address` = the employee address (if user is employer) or the employer
+ * address (if user is the employee). `token`/`amount`/`tokenIcon` always
+ * `"-"`/`-`/`""`.
+ *
+ * **Milestone events** — Synthetic `type` = `"Milestone Added"`.
+ * `address` = the contributor (if user is employer) or the employer (if user
+ * is the contributor). `token`/`amount`/`tokenIcon` always `"-"`/`-`/`""`.
+ *
+ * ## Sort contract
+ * The merged array is sorted by `createdAt` descending, then by `txHash`
+ * ascending for stable tie-breaking. This sort is applied to the full set
+ * of fetched rows; the caller then slices for the requested page.
+ *
+ * ## Deduplication
+ * When `opts.deduplicateAgreementEvents` is `true`, agreement events are
+ * collapsed by their `id` field before merging. The main route enables this;
+ * the filtered route does not.
+ *
+ * @returns The full sorted transaction array and the total count across all
+ *   five sources, so the caller can paginate.
  */
 async function fetchAndBuildTransactions(
   userAddress: string,
@@ -830,7 +940,15 @@ async function fetchAndBuildTransactions(
 
 // ── Response helper ──────────────────────────────────────────────────────
 
-/** Slices, paginates, and sends the unified transaction list. */
+/**
+ * Slices, paginates, and sends the unified transaction list.
+ *
+ * The response body always contains:
+ * - `transactions`: the page of items (`array`, may be empty)
+ * - `total`: the sum of matching rows across all five source tables
+ * - `hasMore`: `true` when `total > offset + limit`
+ * - `limit` / `offset`: the requested parameters (clamped)
+ */
 function respondPaginated(
   res: import("express").Response,
   allTransactions: TransactionItem[],
@@ -851,6 +969,12 @@ function respondPaginated(
 }
 
 // ── Route: main transaction list (with optional event-type filtering) ────
+//
+// Contract:
+// - Accepts `eventTypes` query filter (comma-separated).
+// - Deduplicates agreement events by id.
+// - Employee condition mode: "employer-or-employee".
+// - Does NOT support date-range filtering.
 
 transactionsRouter.get(
   "/transactions/:user_address",
@@ -876,6 +1000,12 @@ transactionsRouter.get(
 );
 
 // ── Route: filtered transaction list (with optional date-range) ──────────
+//
+// Contract:
+// - Accepts `startDate` / `endDate` query filters.
+// - Employee condition mode: "employee-only".
+// - Does NOT deduplicate agreement events.
+// - Does NOT support `eventTypes` filter.
 
 transactionsRouter.get(
   "/transactions/:user_address/filtered",
