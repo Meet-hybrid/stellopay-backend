@@ -3,6 +3,14 @@ import { eq, or, lt, isNotNull } from "drizzle-orm";
 import { env } from "../config.js";
 import { db } from "../db/index.js";
 import { sessions as sessionsTable } from "../db/schema.js";
+import {
+  incSessionMetric,
+  setSessionGauge,
+  logSessionEvent,
+  SESSION_METRICS,
+  SESSION_GAUGES,
+  type SessionRejectionReason,
+} from "./session-metrics.js";
 
 const SESSION_TTL_MS = env.SESSION_TTL_MS;
 const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
@@ -17,6 +25,8 @@ const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
  * Generates a random 24-byte hex token, hashes it with SHA-256 for database storage,
  * and sets sliding and absolute expires timestamps.
  *
+ * Emits a `session.created` log line and bumps `session_created_total`.
+ *
  * @param address - The Starknet wallet address
  * @returns The raw token (to return to the client) and the token expiry time
  */
@@ -25,13 +35,31 @@ export async function createSession(address: string) {
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const familyId = crypto.randomUUID();
   const now = Date.now();
+  const normalizedAddress = address.toLowerCase();
 
-  await db.insert(sessionsTable).values({
-    tokenHash,
-    address: address.toLowerCase(),
-    familyId,
-    expiresAt: new Date(now + SESSION_TTL_MS),
-    absoluteExpiresAt: new Date(now + SESSION_MAX_TTL_MS),
+  try {
+    await db.insert(sessionsTable).values({
+      tokenHash,
+      address: normalizedAddress,
+      familyId,
+      expiresAt: new Date(now + SESSION_TTL_MS),
+      absoluteExpiresAt: new Date(now + SESSION_MAX_TTL_MS),
+    });
+  } catch (error) {
+    logSessionEvent("error", "session.rejected", {
+      reason: "db_error" as SessionRejectionReason,
+      operation: "create",
+      address: normalizedAddress,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
+
+  incSessionMetric(SESSION_METRICS.CREATED);
+  logSessionEvent("info", "session.created", {
+    address: normalizedAddress,
+    expires_in_ms: SESSION_TTL_MS,
+    absolute_expires_in_ms: SESSION_MAX_TTL_MS,
   });
 
   return { token, expires_in_ms: SESSION_TTL_MS };
@@ -41,12 +69,19 @@ export async function createSession(address: string) {
  * Verifies that a given token is valid for a wallet address, checking database existence,
  * expiration, and revocation status. If valid, updates lastSeen and slides the expiry.
  *
+ * Every false return path emits a `session.rejected` log line with a bounded reason
+ * code and bumps the matching metric counter. Successful validation emits
+ * `session.validated` (debug) and bumps `session_validated_total`.
+ *
  * @param address - The Starknet wallet address
  * @param token - The raw session token
  * @returns A promise resolving to true if valid, false otherwise
  */
 export async function requireSession(address: string, token: string): Promise<boolean> {
-  if (!token || !address) return false;
+  if (!token || !address) {
+    recordRejection("missing_input", address);
+    return false;
+  }
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const now = new Date();
 
@@ -57,12 +92,30 @@ export async function requireSession(address: string, token: string): Promise<bo
       .where(eq(sessionsTable.tokenHash, tokenHash))
       .limit(1);
 
-    if (!session) return false;
-    if (session.revokedAt !== null) return false;
-    if (session.rotatedAt !== null) return false;
-    if (session.expiresAt.getTime() < now.getTime()) return false;
-    if (session.absoluteExpiresAt.getTime() < now.getTime()) return false;
-    if (session.address !== address.toLowerCase()) return false;
+    if (!session) {
+      recordRejection("unknown_token", address);
+      return false;
+    }
+    if (session.revokedAt !== null) {
+      recordRejection("revoked", address);
+      return false;
+    }
+    if (session.rotatedAt !== null) {
+      recordRejection("revoked", address);
+      return false;
+    }
+    if (session.expiresAt.getTime() < now.getTime()) {
+      recordRejection("expired_sliding", address);
+      return false;
+    }
+    if (session.absoluteExpiresAt.getTime() < now.getTime()) {
+      recordRejection("expired_absolute", address);
+      return false;
+    }
+    if (session.address !== address.toLowerCase()) {
+      recordRejection("address_mismatch", address);
+      return false;
+    }
 
     // Sliding expiry: extend TTL unless it exceeds the absolute limit
     let nextExpiresAtMs = now.getTime() + SESSION_TTL_MS;
@@ -85,9 +138,21 @@ export async function requireSession(address: string, token: string): Promise<bo
         .where(eq(sessionsTable.tokenHash, tokenHash));
     }
 
+    incSessionMetric(SESSION_METRICS.VALIDATED);
+    logSessionEvent("debug", "session.validated", {
+      address: address.toLowerCase(),
+      next_expires_at: new Date(nextExpiresAtMs).toISOString(),
+    });
+
     return true;
   } catch (error) {
-    console.error("[auth] Database error in requireSession", error);
+    logSessionEvent("error", "session.rejected", {
+      reason: "db_error" as SessionRejectionReason,
+      operation: "require",
+      address: address.toLowerCase(),
+      message: errorMessage(error),
+    });
+    incSessionMetric(SESSION_METRICS.REJECTED);
     return false;
   }
 }
@@ -95,17 +160,28 @@ export async function requireSession(address: string, token: string): Promise<bo
 /**
  * Revokes a session token by marking it as revoked in the database.
  *
+ * Emits `session.revoked` and bumps `session_revoked_total`. An empty
+ * token is treated as a no-op (no log, no metric) so callers can safely
+ * invoke this from middleware that has already validated the token.
+ *
  * @param token - The raw session token to revoke
  */
 export async function revokeSession(token: string): Promise<void> {
-
   if (!token) return;
+  // Hash for the address correlation in the log — we never log the raw token.
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const tokenHashShort = tokenHash.slice(0, 8);
 
   await db
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
     .where(eq(sessionsTable.tokenHash, tokenHash));
+
+  incSessionMetric(SESSION_METRICS.REVOKED);
+  logSessionEvent("info", "session.revoked", {
+    kind: "single",
+    token_hash_prefix: tokenHashShort,
+  });
 }
 
 export type RotateResult =
@@ -122,13 +198,22 @@ export type RotateResult =
  * this is treated as a compromise signal — someone is replaying a stale
  * token — and the entire token family is revoked immediately.
  *
+ * Emits one of:
+ *  - `session.rotated` (info) on success + bumps `session_rotated_total`
+ *  - `session.reuse_detected` (warn) on reuse + bumps `session_reuse_detected_total`
+ *  - `session.rejected` (warn) on invalid input/expired token + bumps `session_rejected_total`
+ *
  * @param address - The Starknet wallet address
  * @param token - The raw refresh token being presented
  */
 export async function rotateSession(address: string, token: string): Promise<RotateResult> {
-  if (!token || !address) return { ok: false, reason: "invalid" };
+  if (!token || !address) {
+    recordRejection("missing_input", address);
+    return { ok: false, reason: "invalid" };
+  }
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const now = new Date();
+  const normalizedAddress = address.toLowerCase();
 
   try {
     return await db.transaction(async (tx) => {
@@ -139,7 +224,8 @@ export async function rotateSession(address: string, token: string): Promise<Rot
         .for("update")
         .limit(1);
 
-      if (!session || session.address !== address.toLowerCase()) {
+      if (!session || session.address !== normalizedAddress) {
+        recordRejection(session ? "address_mismatch" : "unknown_token", address);
         return { ok: false, reason: "invalid" };
       }
 
@@ -148,10 +234,25 @@ export async function rotateSession(address: string, token: string): Promise<Rot
       const familyId = session.familyId ?? session.tokenHash;
 
       if (session.rotatedAt !== null || session.revokedAt !== null) {
+        // Inline family revocation for transaction safety, replicating revokeFamily telemetry
         await tx
           .update(sessionsTable)
           .set({ revokedAt: now })
           .where(eq(sessionsTable.familyId, familyId));
+          
+        incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
+        logSessionEvent("warn", "session.family_revoked", {
+          family_id: familyId,
+        });
+
+        incSessionMetric(SESSION_METRICS.REUSE_DETECTED);
+        logSessionEvent("warn", "session.reuse_detected", {
+          address: normalizedAddress,
+          family_id: familyId,
+          had_rotated_at: session.rotatedAt !== null,
+          had_revoked_at: session.revokedAt !== null,
+        });
+        
         return { ok: false, reason: "reused", familyId };
       }
 
@@ -159,6 +260,10 @@ export async function rotateSession(address: string, token: string): Promise<Rot
         session.expiresAt.getTime() < now.getTime() ||
         session.absoluteExpiresAt.getTime() < now.getTime()
       ) {
+        recordRejection(
+          session.absoluteExpiresAt.getTime() < now.getTime() ? "expired_absolute" : "expired_sliding",
+          address,
+        );
         return { ok: false, reason: "invalid" };
       }
 
@@ -185,10 +290,22 @@ export async function rotateSession(address: string, token: string): Promise<Rot
         .set({ rotatedAt: now })
         .where(eq(sessionsTable.tokenHash, tokenHash));
 
+      incSessionMetric(SESSION_METRICS.ROTATED);
+      logSessionEvent("info", "session.rotated", {
+        address: normalizedAddress,
+        family_id: familyId,
+        expires_in_ms: newExpiresAtMs - nowMs,
+      });
+
       return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
     });
   } catch (error) {
-    console.error("[auth] Database error in rotateSession", error);
+    incSessionMetric(SESSION_METRICS.REJECTED);
+    logSessionEvent("error", "session.rejected", {
+      reason: "db_error",
+      operation: "rotate",
+      error: error instanceof Error ? error.message : String(error),
+    });
     return { ok: false, reason: "invalid" };
   }
 }
@@ -197,6 +314,8 @@ export async function rotateSession(address: string, token: string): Promise<Rot
  * Revokes every token in a rotation family (used when reuse of a stale,
  * already-rotated token is detected — a likely token-theft signal).
  *
+ * Emits `session.family_revoked` (warn) and bumps `session_family_revoked_total`.
+ *
  * @param familyId - The token family identifier
  */
 export async function revokeFamily(familyId: string): Promise<void> {
@@ -204,6 +323,11 @@ export async function revokeFamily(familyId: string): Promise<void> {
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
     .where(eq(sessionsTable.familyId, familyId));
+
+  incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
+  logSessionEvent("warn", "session.family_revoked", {
+    family_id: familyId,
+  });
 }
 
 /**
@@ -211,17 +335,30 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * regardless of family. Used by the /auth/revoke endpoint (e.g. "sign out
  * everywhere" or an admin-triggered account lockdown).
  *
+ * Emits `session.all_revoked` (info) and bumps `session_all_revoked_total`.
+ *
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
+  const normalizedAddress = address.toLowerCase();
   await db
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.address, address.toLowerCase()));
+    .where(eq(sessionsTable.address, normalizedAddress));
+
+  incSessionMetric(SESSION_METRICS.ALL_REVOKED);
+  logSessionEvent("info", "session.all_revoked", {
+    address: normalizedAddress,
+  });
 }
 
 /**
  * Removes every session whose TTL has elapsed or has been explicitly revoked.
+ *
+ * Emits `session.sweep_completed` (info) on success and bumps both
+ * `session_sweep_runs_total` and `session_sweep_deleted_total`; emits
+ * `session.sweep_failed` (error) on DB error and bumps
+ * `session_sweeper_errors_total`.
  *
  * @param now - Optional timestamp override (default Date.now())
  * @returns A promise resolving to the number of rows deleted
@@ -239,10 +376,60 @@ export async function sweepExpiredSessions(now: number = Date.now()): Promise<nu
         ),
       )
       .returning({ tokenHash: sessionsTable.tokenHash });
-    return deleted.length;
+    const count = deleted.length;
+    incSessionMetric(SESSION_METRICS.SWEEP_RUNS);
+    incSessionMetric(SESSION_METRICS.SWEEP_DELETED, count);
+    setSessionGauge(SESSION_GAUGES.LAST_SWEEP_DELETED, count);
+    setSessionGauge(SESSION_GAUGES.LAST_SWEEP_AT_MS, now);
+    logSessionEvent("info", "session.sweep_completed", {
+      deleted: count,
+      now: nowDate.toISOString(),
+    });
+    return count;
   } catch (error) {
-    console.error("[auth] Database error in sweepExpiredSessions", error);
+    incSessionMetric(SESSION_METRICS.SWEEPER_ERRORS);
+    logSessionEvent("error", "session.sweep_failed", {
+      message: errorMessage(error),
+    });
     return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function recordRejection(reason: SessionRejectionReason, address: string | undefined): void {
+  incSessionMetric(SESSION_METRICS.REJECTED);
+  switch (reason) {
+    case "unknown_token":
+      incSessionMetric(SESSION_METRICS.REJECTED_UNKNOWN);
+      break;
+    case "address_mismatch":
+      incSessionMetric(SESSION_METRICS.REJECTED_ADDRESS_MISMATCH);
+      break;
+    case "revoked":
+      incSessionMetric(SESSION_METRICS.REJECTED_REVOKED);
+      break;
+    case "expired_sliding":
+    case "expired_absolute":
+      incSessionMetric(SESSION_METRICS.REJECTED_EXPIRED);
+      break;
+    // "missing_input" and "db_error" are bucketed only under the global
+    // REJECTED counter; no per-reason counter to keep cardinality bounded.
+  }
+  logSessionEvent("warn", "session.rejected", {
+    reason,
+    address: address?.toLowerCase(),
+  });
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
   }
 }
 
@@ -252,7 +439,10 @@ export async function sweepExpiredSessions(now: number = Date.now()): Promise<nu
 if (env.NODE_ENV !== "test") {
   setInterval(() => {
     sweepExpiredSessions().catch((err) => {
-      console.error("[auth] Background sweeper failed", err);
+      incSessionMetric(SESSION_METRICS.SWEEPER_ERRORS);
+      logSessionEvent("error", "session.sweeper_crashed", {
+        message: errorMessage(err),
+      });
     });
   }, SESSION_SWEEP_INTERVAL_MS).unref();
 }
