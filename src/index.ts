@@ -128,12 +128,20 @@ const globalLimiter = makeLimiter({
   skip: (req) => req.path === "/health",
 });
 
-// Strict limiter for unauthenticated, side-effecting auth and contact endpoints.
+// Strict limiter for unauthenticated, side-effecting auth endpoints.
 const strictLimiter = makeLimiter({
   name: "strict",
   windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
   max: env.RATE_LIMIT_STRICT_MAX,
   message: "Too many requests from this IP, please try again later.",
+});
+
+// Contact form limiter (stricter) - prevents spam on the public contact form.
+const contactLimiter = makeLimiter({
+  name: "contact",
+  windowMs: env.RATE_LIMIT_CONTACT_WINDOW_MS,
+  max: env.RATE_LIMIT_CONTACT_MAX,
+  message: "Too many contact form submissions. Please try again later.",
 });
 
 // Apply global rate limiter to all API routes
@@ -162,8 +170,8 @@ app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
-// Apply strict rate limiting to contact endpoint
-app.use("/api/v1/contact", strictLimiter);
+// Apply contact-specific rate limiting to contact endpoint
+app.use("/api/v1/contact", contactLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);
