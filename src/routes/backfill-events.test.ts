@@ -13,8 +13,11 @@ vi.mock("../auth/middleware.js", () => ({
 }));
 
 const { mockDb, mockInsertReturning, mockTransaction } = vi.hoisted(() => {
-  const onConflictDoNothing = vi.fn().mockResolvedValue({});
-  const insertReturning = { values: vi.fn().mockReturnThis(), onConflictDoNothing };
+  const returning = vi.fn().mockResolvedValue([]);
+  const insertReturning: any = {};
+  insertReturning.values = vi.fn().mockReturnValue(insertReturning);
+  insertReturning.onConflictDoNothing = vi.fn().mockReturnValue(insertReturning);
+  insertReturning.returning = returning;
   const insert = vi.fn().mockReturnValue(insertReturning);
   const transaction = vi.fn();
   const execute = vi.fn();
@@ -69,8 +72,8 @@ describe("Backfill contract constants", () => {
     expect(DEFAULT_BACKFILL_LIMIT).toBe(1000);
   });
 
-  it("BACKFILL_EVENT_INDEX is -1 (impossible for real events)", () => {
-    expect(BACKFILL_EVENT_INDEX).toBe(-1);
+  it("BACKFILL_EVENT_INDEX is 0 (satisfies DB CHECK constraint)", () => {
+    expect(BACKFILL_EVENT_INDEX).toBe(0);
   });
 
   it("RESULTS_PREVIEW_SIZE is 10", () => {
@@ -140,6 +143,16 @@ describe("BackfillQuerySchema", () => {
   it("leaves agreementId undefined when not provided", () => {
     const result = BackfillQuerySchema.parse({});
     expect(result.agreementId).toBeUndefined();
+  });
+
+  it("accepts an optional cursor parameter", () => {
+    const result = BackfillQuerySchema.parse({ cursor: "2024-06-01T00:00:00.000Z" });
+    expect(result.cursor).toBe("2024-06-01T00:00:00.000Z");
+  });
+
+  it("leaves cursor undefined when not provided", () => {
+    const result = BackfillQuerySchema.parse({});
+    expect(result.cursor).toBeUndefined();
   });
 });
 
@@ -335,6 +348,7 @@ describe("Backfill Events Routes", () => {
 
     it("backfills EmployeeAdded events successfully", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -363,8 +377,9 @@ describe("Backfill Events Routes", () => {
       expect(res.body.totalScanned).toBe(0);
     });
 
-    it("uses collision-safe event ID scheme and eventIndex -1", async () => {
+    it("uses collision-safe event ID scheme and eventIndex 0", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -378,12 +393,13 @@ describe("Backfill Events Routes", () => {
 
       expect(insertedValues).not.toBeNull();
       expect(insertedValues.id).toBe("0xtx1_backfill_EmployeeAdded_emp_1");
-      expect(insertedValues.eventIndex).toBe(-1);
+      expect(insertedValues.eventIndex).toBe(0);
       expect(insertedValues.eventType).toBe("EmployeeAdded");
     });
 
     it("event ID matches buildBackfillEventId output", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -401,6 +417,7 @@ describe("Backfill Events Routes", () => {
 
     it("eventIndex matches BACKFILL_EVENT_INDEX constant", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -417,6 +434,7 @@ describe("Backfill Events Routes", () => {
 
     it("runs inserts inside a transaction", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -428,6 +446,7 @@ describe("Backfill Events Routes", () => {
 
     it("uses onConflictDoNothing for idempotent inserts", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -474,6 +493,7 @@ describe("Backfill Events Routes", () => {
         created_at: new Date("2024-01-01"),
       }));
       mockDb.execute.mockResolvedValue({ rows: manyRows });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "inserted" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -493,6 +513,7 @@ describe("Backfill Events Routes", () => {
         created_at: new Date("2024-01-01"),
       }));
       mockDb.execute.mockResolvedValue({ rows: manyRows });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "inserted" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -520,6 +541,7 @@ describe("Backfill Events Routes", () => {
         { ...mockEmployeeRow, id: "emp_3", transaction_hash: "0xtx3" },
       ];
       mockDb.execute.mockResolvedValue({ rows: threeRows });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "inserted" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -532,6 +554,7 @@ describe("Backfill Events Routes", () => {
 
     it("response has the documented BackfillResponse shape", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
@@ -614,6 +637,52 @@ describe("Backfill Events Routes", () => {
         expect(res.body.nextCursor).toBe(new Date("2024-01-01").toISOString());
       });
     });
+
+    it("returns cursor from last row's created_at", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
+
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events")
+        .expect(200);
+
+      expect(res.body.cursor).toBe("2024-01-01T00:00:00.000Z");
+    });
+
+    it("returns null cursor when no rows", async () => {
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events")
+        .expect(200);
+
+      expect(res.body.cursor).toBeNull();
+    });
+
+    it("accepts cursor query parameter", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [] });
+
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events?cursor=2024-06-01T00:00:00.000Z")
+        .expect(200);
+
+      expect(res.body.cursor).toBeNull();
+      expect(mockDb.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts only actually inserted rows on conflict", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow, { ...mockEmployeeRow, id: "emp_2" }] });
+      mockInsertReturning.returning
+        .mockResolvedValueOnce([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }])
+        .mockResolvedValueOnce([]);
+
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events")
+        .expect(200);
+
+      expect(res.body.created).toBe(1);
+      expect(res.body.results).toHaveLength(2);
+      expect(res.body.results[0].status).toBe("created");
+      expect(res.body.results[1].status).toBe("skipped");
+    });
   });
 
   describe("POST /backfill/milestone-events", () => {
@@ -628,6 +697,7 @@ describe("Backfill Events Routes", () => {
 
     it("backfills MilestoneAdded events successfully", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/milestone-events")
@@ -648,6 +718,7 @@ describe("Backfill Events Routes", () => {
 
     it("uses collision-safe event IDs", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -660,12 +731,13 @@ describe("Backfill Events Routes", () => {
         .expect(200);
 
       expect(insertedValues!.id).toBe("0xtx2_backfill_MilestoneAdded_ms_1");
-      expect(insertedValues!.eventIndex).toBe(-1);
+      expect(insertedValues!.eventIndex).toBe(0);
       expect(insertedValues!.eventType).toBe("MilestoneAdded");
     });
 
     it("event ID matches buildBackfillEventId output", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -683,6 +755,7 @@ describe("Backfill Events Routes", () => {
 
     it("eventIndex matches BACKFILL_EVENT_INDEX constant", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       let insertedValues: any = null;
       mockInsertReturning.values.mockImplementation((values: any) => {
@@ -699,6 +772,7 @@ describe("Backfill Events Routes", () => {
 
     it("runs inserts inside a transaction", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       await request(app)
         .post("/api/v1/backfill/milestone-events")
@@ -709,6 +783,7 @@ describe("Backfill Events Routes", () => {
 
     it("uses onConflictDoNothing for idempotent inserts", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       await request(app)
         .post("/api/v1/backfill/milestone-events")
@@ -746,6 +821,7 @@ describe("Backfill Events Routes", () => {
         created_at: new Date("2024-02-01"),
       }));
       mockDb.execute.mockResolvedValue({ rows: manyRows });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "inserted" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/milestone-events")
@@ -768,6 +844,7 @@ describe("Backfill Events Routes", () => {
 
     it("response has the documented BackfillResponse shape", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
       const res = await request(app)
         .post("/api/v1/backfill/milestone-events")
@@ -846,6 +923,52 @@ describe("Backfill Events Routes", () => {
 
         expect(res.body.hasMore).toBe(false);
       });
+    });
+
+    it("returns cursor from last row's created_at for milestones", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
+
+      const res = await request(app)
+        .post("/api/v1/backfill/milestone-events")
+        .expect(200);
+
+      expect(res.body.cursor).toBe("2024-02-01T00:00:00.000Z");
+    });
+
+    it("returns null cursor when no milestone rows", async () => {
+      const res = await request(app)
+        .post("/api/v1/backfill/milestone-events")
+        .expect(200);
+
+      expect(res.body.cursor).toBeNull();
+    });
+
+    it("accepts cursor query parameter for milestones", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [] });
+
+      const res = await request(app)
+        .post("/api/v1/backfill/milestone-events?cursor=2024-06-01T00:00:00.000Z")
+        .expect(200);
+
+      expect(res.body.cursor).toBeNull();
+      expect(mockDb.execute).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts only actually inserted rows on conflict for milestones", async () => {
+      mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow, { ...mockMilestoneRow, id: "ms_2" }] });
+      mockInsertReturning.returning
+        .mockResolvedValueOnce([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }])
+        .mockResolvedValueOnce([]);
+
+      const res = await request(app)
+        .post("/api/v1/backfill/milestone-events")
+        .expect(200);
+
+      expect(res.body.created).toBe(1);
+      expect(res.body.results).toHaveLength(2);
+      expect(res.body.results[0].status).toBe("created");
+      expect(res.body.results[1].status).toBe("skipped");
     });
   });
 });

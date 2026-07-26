@@ -19,10 +19,11 @@ export const DEFAULT_BACKFILL_LIMIT = 1000;
 
 /**
  * Sentinel `eventIndex` value written for every synthetic backfill row.
- * Real on-chain events always have `eventIndex >= 0`, so **-1** makes
- * backfill rows trivially distinguishable.
+ * The `_backfill_` segment in the synthetic event ID already distinguishes
+ * backfill rows from real on-chain events, so eventIndex is set to 0 to
+ * satisfy the DB CHECK constraint (`event_index >= 0`).
  */
-export const BACKFILL_EVENT_INDEX = -1;
+export const BACKFILL_EVENT_INDEX = 0;
 
 /** How many result objects the response preview (`results` array) may contain. */
 export const RESULTS_PREVIEW_SIZE = 10;
@@ -178,7 +179,7 @@ backfillEventsRouter.post(
             String(employee.id),
           );
 
-          await tx
+          const inserted = await tx
             .insert(schema.agreementEvents)
             .values({
               id: eventId,
@@ -189,13 +190,16 @@ backfillEventsRouter.post(
               transactionHash: String(employee.transaction_hash),
               eventIndex: BACKFILL_EVENT_INDEX,
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning();
 
-          created++;
+          if (inserted.length > 0) {
+            created++;
+          }
           results.push({
             employeeId: String(employee.id),
             agreementId: String(employee.agreement_id),
-            status: "created",
+            status: inserted.length > 0 ? "created" : "skipped",
           });
         }
       });
@@ -298,7 +302,7 @@ backfillEventsRouter.post(
             String(milestone.id),
           );
 
-          await tx
+          const inserted = await tx
             .insert(schema.agreementEvents)
             .values({
               id: eventId,
@@ -309,13 +313,16 @@ backfillEventsRouter.post(
               transactionHash: String(milestone.transaction_hash),
               eventIndex: BACKFILL_EVENT_INDEX,
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning();
 
-          created++;
+          if (inserted.length > 0) {
+            created++;
+          }
           results.push({
             milestoneId: String(milestone.id),
             agreementId: String(milestone.agreement_id),
-            status: "created",
+            status: inserted.length > 0 ? "created" : "skipped",
           });
         }
       });
