@@ -16,26 +16,88 @@ const CHALLENGE_TTL_MS = 5 * 60 * 1000;
  * for every unauthenticated challenge request. If the server restarts or a different instance
  * handles the verification, the user's wallet client simply requests a new challenge nonce with no
  * negative security implications and minimal user friction.
+ *
+ * INVARIANTS:
+ * - At most ONE active (non-expired) challenge per address at any time. Issuing a new one for
+ *   an address that already has an active entry is an idempotent replay — it returns the
+ *   existing nonce and does NOT push the TTL forward.
+ * - The Map key is always the lower-cased address, so mixed-case retries collide and map
+ *   to the same entry. The TTL is anchored to the ORIGINAL creation time, never extended.
+ *   This bounds the worst-case replay window even if the original nonce leaked.
+ * - Lazy eviction: an entry only leaves the Map when (a) `consumeChallenge` reads it
+ *   successfully (signature verified), (b) `getChallenge` or `consumeChallenge` discovers
+ *   it has expired, or (c) `createChallenge` issues a fresh one on top of an expired entry.
+ *   There is no background sweeper by design — see the "Out of scope" section below.
  */
 export const challenges = new Map<string, ChallengeRecord>();
 
 /**
- * Generates a challenge nonce for verification.
+ * Test hook. Clears the in-memory challenge Map. Production code MUST NOT call this
+ * — there is no compensating action for a deliberately-cleared challenge, and a single
+ * process eviction would invalidate any concurrent verify attempt for that address.
+ *
+ * Mirrors `clearBillingIdempotencyStore` in `src/routes/billing.ts`.
+ */
+export function clearChallengesForTesting(): void {
+  challenges.clear();
+}
+
+/**
+ * Generates a challenge nonce for verification, or returns the active one if one already
+ * exists for this address.
+ *
+ * Contract (idempotent on retry):
+ * - If the address has an entry in the Map whose `expiresAtMs` is strictly in the future
+ *   (relative to `Date.now()`), the EXISTING nonce is returned along with the time
+ *   REMAINING on its TTL. A `challenge_replayed` metric is emitted instead of a fresh
+ *   `challenge_created`. This makes the `/auth/challenge` endpoint retry-safe: a
+ *   duplicated request cannot accidentally invalidate an in-flight verify attempt.
+ * - If the address has no entry, OR has an expired entry (lazy-evicted), a fresh nonce
+ *   is generated, stored, and returned, with `expires_in_ms === CHALLENGE_TTL_MS`.
+ * - The TTL is NEVER pushed forward on a replay. Anchoring it to the original creation
+ *   time caps the worst-case replay window at one TTL regardless of how many retries
+ *   the client (or a network midpoint) retransmits.
  *
  * @param address - The user's Starknet wallet address
- * @returns The generated nonce and its TTL
+ * @returns The same nonce as the active challenge (replay) or a fresh one; the time
+ *   remaining on the challenge TTL.
  */
 export function createChallenge(address: string) {
+  const key = address.toLowerCase();
+  const now = Date.now();
+  const existing = challenges.get(key);
+
+  if (existing && existing.expiresAtMs > now) {
+    const remainingMs = existing.expiresAtMs - now;
+    console.info(
+      JSON.stringify({
+        metric: "challenge_replayed",
+        address: key,
+        expires_in_ms: remainingMs,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    return { nonce: existing.nonce, expires_in_ms: remainingMs };
+  }
+
+  // Either there is no entry, or the entry exists but has already expired. Lazy-evict
+  // the expired entry so we don't keep a dead record around.
+  if (existing) {
+    challenges.delete(key);
+  }
+
   const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
-  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: Date.now() + CHALLENGE_TTL_MS });
-  
-  // Structured log/metric for challenge generation
-  console.info(JSON.stringify({
-    metric: "challenge_created",
-    address: address.toLowerCase(),
-    expires_in_ms: CHALLENGE_TTL_MS,
-    timestamp: new Date().toISOString()
-  }));
+  const expiresAtMs = now + CHALLENGE_TTL_MS;
+  challenges.set(key, { nonce, expiresAtMs });
+
+  console.info(
+    JSON.stringify({
+      metric: "challenge_created",
+      address: key,
+      expires_in_ms: CHALLENGE_TTL_MS,
+      timestamp: new Date().toISOString(),
+    }),
+  );
 
   return { nonce, expires_in_ms: CHALLENGE_TTL_MS };
 }
@@ -47,24 +109,29 @@ export function createChallenge(address: string) {
  * @returns The challenge record if found and valid, otherwise null
  */
 export function getChallenge(address: string) {
-  const rec = challenges.get(address.toLowerCase());
+  const key = address.toLowerCase();
+  const rec = challenges.get(key);
   if (!rec) {
-    console.info(JSON.stringify({
-      metric: "challenge_miss",
-      reason: "not_found",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+    console.info(
+      JSON.stringify({
+        metric: "challenge_miss",
+        reason: "not_found",
+        address: key,
+        timestamp: new Date().toISOString(),
+      }),
+    );
     return null;
   }
-  
+
   if (Date.now() > rec.expiresAtMs) {
-    challenges.delete(address.toLowerCase());
-    console.info(JSON.stringify({
-      metric: "challenge_expired",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+    challenges.delete(key);
+    console.info(
+      JSON.stringify({
+        metric: "challenge_expired",
+        address: key,
+        timestamp: new Date().toISOString(),
+      }),
+    );
     return null;
   }
   return rec;
@@ -76,13 +143,16 @@ export function getChallenge(address: string) {
  * @param address - The user's Starknet wallet address
  */
 export function clearChallenge(address: string) {
-  const deleted = challenges.delete(address.toLowerCase());
+  const key = address.toLowerCase();
+  const deleted = challenges.delete(key);
   if (deleted) {
-    console.info(JSON.stringify({
-      metric: "challenge_cleared",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+    console.info(
+      JSON.stringify({
+        metric: "challenge_cleared",
+        address: key,
+        timestamp: new Date().toISOString(),
+      }),
+    );
   }
 }
 
@@ -102,14 +172,16 @@ export function clearChallenge(address: string) {
 export function consumeChallenge(address: string) {
   const rec = getChallenge(address);
   if (!rec) return null;
-  
+
   challenges.delete(address.toLowerCase());
-  console.info(JSON.stringify({
-    metric: "challenge_consumed",
-    address: address.toLowerCase(),
-    timestamp: new Date().toISOString()
-  }));
-  
+  console.info(
+    JSON.stringify({
+      metric: "challenge_consumed",
+      address: address.toLowerCase(),
+      timestamp: new Date().toISOString(),
+    }),
+  );
+
   return rec;
 }
 
@@ -123,7 +195,7 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
   // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
   // They expect plain string values like:
   // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"
-  // - domain.name/version: plain strings
+  // - domain.name/version: plain string
   // - message.action: plain string
   // (starknet.js will encode these according to the declared `felt` types when hashing/verifying)
   const chainIdLabel = shortString.decodeShortString(chainId);
