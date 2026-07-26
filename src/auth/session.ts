@@ -555,6 +555,44 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
 }
 
 /**
+ * Retrieves a session from the database by its token hash.
+ *
+ * @param tokenHash - The SHA-256 hash of the session token
+ */
+export async function getSessionByHash(
+  tokenHash: string,
+): Promise<typeof sessionsTable.$inferSelect | null> {
+  if (!tokenHash) return null;
+  const [session] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  return session || null;
+}
+
+/**
+ * Revokes a session by its token hash.
+ *
+ * @param tokenHash - The SHA-256 hash of the session token to revoke
+ */
+export async function revokeSessionByHash(tokenHash: string): Promise<void> {
+  if (!tokenHash) return;
+  const tokenHashShort = tokenHash.slice(0, 8);
+
+  await db
+    .update(sessionsTable)
+    .set({ revokedAt: new Date() })
+    .where(eq(sessionsTable.tokenHash, tokenHash));
+
+  incSessionMetric(SESSION_METRICS.REVOKED);
+  logSessionEvent("info", "session.revoked", {
+    kind: "single",
+    token_hash_prefix: tokenHashShort,
+  });
+}
+
+/**
  * Removes every session whose TTL has elapsed or has been explicitly revoked.
  *
  * Emits `session.sweep_completed` (info) on success and bumps both
