@@ -17,11 +17,24 @@ const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
+// Session lifecycle contract in this module:
+// - each row persists a hashed token, the normalized wallet address, and two expiry timestamps;
+// - the sliding expiry (`expiresAt`) can move forward on successful use, but never past the
+//   immutable absolute cap (`absoluteExpiresAt`);
+// - the row is invalidated once it is revoked or rotated.
+function normalizeSessionAddress(address: string): string {
+  return address.toLowerCase();
+}
+
+function getNextSlidingExpiryMs(nowMs: number, absoluteExpiresAt: Date): number {
+  const slidingExpiryMs = nowMs + SESSION_TTL_MS;
+  return Math.min(slidingExpiryMs, absoluteExpiresAt.getTime());
+}
 
 /**
  * Creates a new session in PostgreSQL for the given wallet address.
  * Generates a random 24-byte hex token, hashes it with SHA-256 for database storage,
- * and sets sliding and absolute expires timestamps.
+ * and sets sliding and absolute expiry timestamps.
  *
  * Emits a `session.created` log line and bumps `session_created_total`.
  *
@@ -33,7 +46,7 @@ export async function createSession(address: string) {
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const familyId = crypto.randomUUID();
   const now = Date.now();
-  const normalizedAddress = address.toLowerCase();
+  const normalizedAddress = normalizeSessionAddress(address);
 
   try {
     await db.insert(sessionsTable).values({
@@ -44,6 +57,7 @@ export async function createSession(address: string) {
       absoluteExpiresAt: new Date(now + SESSION_MAX_TTL_MS),
     });
   } catch (error) {
+    incSessionMetric(SESSION_METRICS.REJECTED);
     logSessionEvent("error", "session.rejected", {
       reason: "db_error" as SessionRejectionReason,
       operation: "create",
@@ -115,11 +129,7 @@ export async function requireSession(address: string, token: string): Promise<bo
       return false;
     }
 
-    // Sliding expiry: extend TTL unless it exceeds the absolute limit
-    let nextExpiresAtMs = now.getTime() + SESSION_TTL_MS;
-    if (nextExpiresAtMs > session.absoluteExpiresAt.getTime()) {
-      nextExpiresAtMs = session.absoluteExpiresAt.getTime();
-    }
+    const nextExpiresAtMs = getNextSlidingExpiryMs(now.getTime(), session.absoluteExpiresAt);
 
     await db
       .update(sessionsTable)
@@ -131,7 +141,7 @@ export async function requireSession(address: string, token: string): Promise<bo
 
     incSessionMetric(SESSION_METRICS.VALIDATED);
     logSessionEvent("debug", "session.validated", {
-      address: address.toLowerCase(),
+      address: normalizeSessionAddress(address),
       next_expires_at: new Date(nextExpiresAtMs).toISOString(),
     });
 
@@ -140,7 +150,7 @@ export async function requireSession(address: string, token: string): Promise<bo
     logSessionEvent("error", "session.rejected", {
       reason: "db_error" as SessionRejectionReason,
       operation: "require",
-      address: address.toLowerCase(),
+      address: normalizeSessionAddress(address),
       message: errorMessage(error),
     });
     incSessionMetric(SESSION_METRICS.REJECTED);
@@ -204,7 +214,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
   }
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const now = new Date();
-  const normalizedAddress = address.toLowerCase();
+  const normalizedAddress = normalizeSessionAddress(address);
 
   const [session] = await db
     .select()
@@ -247,10 +257,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
   const newToken = crypto.randomBytes(24).toString("hex");
   const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
   const nowMs = now.getTime();
-  let newExpiresAtMs = nowMs + SESSION_TTL_MS;
-  if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
-    newExpiresAtMs = session.absoluteExpiresAt.getTime();
-  }
+  const newExpiresAtMs = getNextSlidingExpiryMs(nowMs, session.absoluteExpiresAt);
 
   // Issue the replacement before marking the old one rotated, so a failure
   // here leaves the old token intact instead of orphaning the session.
@@ -307,7 +314,7 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
-  const normalizedAddress = address.toLowerCase();
+  const normalizedAddress = normalizeSessionAddress(address);
   await db
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
