@@ -14,6 +14,38 @@ import { normalizeStarknetAddress } from "./address.js";
  * StarknetAddress.parse("0x4718F5a..."); // canonical normalized address
  * StarknetAddress.parse("abc");          // also accepted, normalized to 0x..0abc
  */
+
+interface ValidationErrorMetric {
+  validator: string;
+  input: string;
+  error: string;
+  timestamp: string;
+}
+
+function logValidationError(metric: ValidationErrorMetric): void {
+  console.warn(
+    `[validation:error] ${JSON.stringify(metric)}`,
+  );
+}
+
+/**
+ * Wraps a Zod schema with error logging. On parse failure, logs structured
+ * diagnostics before re-throwing so production failures are traceable.
+ */
+export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    logValidationError({
+      validator: validatorName,
+      input: typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40),
+      error: result.error.issues.map((i) => i.message).join("; "),
+      timestamp: new Date().toISOString(),
+    });
+    throw result.error;
+  }
+  return result.data;
+}
+
 export const StarknetAddress = z
   .string()
   .trim()
@@ -69,3 +101,4 @@ export function parsePagination(query: unknown): {
     offset: Math.max(offsetRaw, 0),
   };
 }
+
