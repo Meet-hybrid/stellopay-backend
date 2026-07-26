@@ -6,6 +6,8 @@ import { sessions as sessionsTable } from "../db/schema.js";
 
 const SESSION_TTL_MS = env.SESSION_TTL_MS;
 const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
+// Do not write to DB to update lastSeen/expiresAt if it was updated less than 1 minute ago.
+const SESSION_UPDATE_THRESHOLD_MS = 60 * 1000;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -68,13 +70,20 @@ export async function requireSession(address: string, token: string): Promise<bo
       nextExpiresAtMs = session.absoluteExpiresAt.getTime();
     }
 
-    await db
-      .update(sessionsTable)
-      .set({
-        lastSeen: now,
-        expiresAt: new Date(nextExpiresAtMs),
-      })
-      .where(eq(sessionsTable.tokenHash, tokenHash));
+    // Only update database if lastSeen is not set or threshold has elapsed to reduce repeated write I/O
+    const shouldUpdate =
+      !session.lastSeen ||
+      (now.getTime() - session.lastSeen.getTime() >= SESSION_UPDATE_THRESHOLD_MS);
+
+    if (shouldUpdate) {
+      await db
+        .update(sessionsTable)
+        .set({
+          lastSeen: now,
+          expiresAt: new Date(nextExpiresAtMs),
+        })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+    }
 
     return true;
   } catch (error) {
@@ -121,56 +130,67 @@ export async function rotateSession(address: string, token: string): Promise<Rot
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const now = new Date();
 
-  const [session] = await db
-    .select()
-    .from(sessionsTable)
-    .where(eq(sessionsTable.tokenHash, tokenHash))
-    .limit(1);
+  try {
+    return await db.transaction(async (tx) => {
+      const [session] = await tx
+        .select()
+        .from(sessionsTable)
+        .where(eq(sessionsTable.tokenHash, tokenHash))
+        .for("update")
+        .limit(1);
 
-  if (!session || session.address !== address.toLowerCase()) {
+      if (!session || session.address !== address.toLowerCase()) {
+        return { ok: false, reason: "invalid" };
+      }
+
+      // Fallback for rows created before this migration: treat the token itself
+      // as the root of its own family so future rotations still chain correctly.
+      const familyId = session.familyId ?? session.tokenHash;
+
+      if (session.rotatedAt !== null || session.revokedAt !== null) {
+        await tx
+          .update(sessionsTable)
+          .set({ revokedAt: now })
+          .where(eq(sessionsTable.familyId, familyId));
+        return { ok: false, reason: "reused", familyId };
+      }
+
+      if (
+        session.expiresAt.getTime() < now.getTime() ||
+        session.absoluteExpiresAt.getTime() < now.getTime()
+      ) {
+        return { ok: false, reason: "invalid" };
+      }
+
+      const newToken = crypto.randomBytes(24).toString("hex");
+      const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
+      const nowMs = now.getTime();
+      let newExpiresAtMs = nowMs + SESSION_TTL_MS;
+      if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
+        newExpiresAtMs = session.absoluteExpiresAt.getTime();
+      }
+
+      // Issue the replacement before marking the old one rotated, so a failure
+      // here leaves the old token intact instead of orphaning the session.
+      await tx.insert(sessionsTable).values({
+        tokenHash: newTokenHash,
+        address: session.address,
+        familyId,
+        expiresAt: new Date(newExpiresAtMs),
+        absoluteExpiresAt: session.absoluteExpiresAt,
+      });
+
+      await tx
+        .update(sessionsTable)
+        .set({ rotatedAt: now })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+
+      return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
+    });
+  } catch (error) {
+    console.error("[auth] Database error in rotateSession", error);
     return { ok: false, reason: "invalid" };
   }
-
-  // Fallback for rows created before this migration: treat the token itself
-  // as the root of its own family so future rotations still chain correctly.
-  const familyId = session.familyId ?? session.tokenHash;
-
-  if (session.rotatedAt !== null || session.revokedAt !== null) {
-    await revokeFamily(familyId);
-    return { ok: false, reason: "reused", familyId };
-  }
-
-  if (
-    session.expiresAt.getTime() < now.getTime() ||
-    session.absoluteExpiresAt.getTime() < now.getTime()
-  ) {
-    return { ok: false, reason: "invalid" };
-  }
-
-  const newToken = crypto.randomBytes(24).toString("hex");
-  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
-  const nowMs = now.getTime();
-  let newExpiresAtMs = nowMs + SESSION_TTL_MS;
-  if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
-    newExpiresAtMs = session.absoluteExpiresAt.getTime();
-  }
-
-  // Issue the replacement before marking the old one rotated, so a failure
-  // here leaves the old token intact instead of orphaning the session.
-  await db.insert(sessionsTable).values({
-    tokenHash: newTokenHash,
-    address: session.address,
-    familyId,
-    expiresAt: new Date(newExpiresAtMs),
-    absoluteExpiresAt: session.absoluteExpiresAt,
-  });
-
-  await db
-    .update(sessionsTable)
-    .set({ rotatedAt: now })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
-
-  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
 }
 
 /**

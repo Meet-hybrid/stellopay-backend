@@ -22,9 +22,15 @@ A session becomes invalid if any of the following conditions are met when evalua
 - The session has been explicitly revoked (`revokedAt !== null`).
 - The token has been rotated (`rotatedAt !== null`). This is a key safety boundary: a token that has been rotated can no longer be used for standard session operations.
 
+#### Sliding Expiration Write-Throttling
+To minimize database write load during frequent API requests, `requireSession` implements write-throttling. The session's `lastSeen` and `expiresAt` timestamps are only updated in the database if the time elapsed since `lastSeen` is at least 1 minute (`60,000 ms`). Validations occurring within this 1-minute window return successfully without invoking write operations to the database.
+
 ### Token Rotation
 
 We support rotating refresh tokens (`rotateSession(address, token)`) which provides a new token while retaining the original session's `absoluteExpiresAt` bounds and `familyId`. The original token is marked as rotated (`rotatedAt = now`).
+
+#### Concurrency & Transaction Safety
+Token rotation is executed within a database transaction using row-level locking (`FOR UPDATE` on the matched session). This guarantees that concurrent rotation requests do not result in race conditions, ensuring that compromise detection and family revocation behave deterministically.
 
 #### Compromise Detection (Family Revocation)
 
