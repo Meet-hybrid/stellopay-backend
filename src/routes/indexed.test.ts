@@ -205,7 +205,7 @@ describe("indexed routes data paths", () => {
       `/api/v1/indexed/agreement/${VALID}/99`
     );
     expect(res.status).toBe(404);
-    expect(res.body.error).toBe("Agreement not found");
+    expect(res.body).toMatchObject({ success: false, error: "Agreement not found" });
   });
 
   it("returns aggregated detail when an agreement exists", async () => {

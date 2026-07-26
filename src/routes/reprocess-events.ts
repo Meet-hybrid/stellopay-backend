@@ -8,6 +8,7 @@ import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -66,7 +67,7 @@ reprocessEventsRouter.post(
       const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -80,7 +81,7 @@ reprocessEventsRouter.post(
         return;
       }
       if (e.message === "Transaction not found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
       next(e);

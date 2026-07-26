@@ -10,6 +10,7 @@ import { shortString, Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
+import { notFoundResponse } from "./not-found.js";
 
 const AddressParam = z.string().min(3);
 
@@ -523,7 +524,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
     const result = await processTxReceipt(tx_hash);
 
     if (result.status === "not_found") {
-      res.status(404).json({ error: "Transaction not found" });
+      notFoundResponse(res, "Transaction not found");
       return;
     }
 
