@@ -7,6 +7,32 @@ import { formatTokenAmount, getTokenInfo } from "../utils/token-formatting.js";
 
 export const notificationsRouter = Router();
 
+export interface NotificationPreferences {
+  payments: boolean;
+  agreements: boolean;
+  escrow: boolean;
+  disputes: boolean;
+}
+
+/**
+ * Returns default notification category preferences for users (all categories enabled).
+ */
+export function getDefaultNotificationPreferences(): NotificationPreferences {
+  return {
+    payments: true,
+    agreements: true,
+    escrow: true,
+    disputes: true,
+  };
+}
+
+/**
+ * Computes the total unread count from a list of notification items.
+ */
+export function calculateUnreadCount(notifications: Array<{ read: boolean }>): number {
+  return notifications.filter((n) => !n.read).length;
+}
+
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
   try {
@@ -133,8 +159,15 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, limit);
 
-    res.json({ notifications, total: notifications.length });
+    const unreadCount = calculateUnreadCount(notifications);
+
+    res.json({
+      notifications,
+      total: notifications.length,
+      unreadCount,
+    });
   } catch (e) {
     next(e);
   }
 });
+
