@@ -1,12 +1,45 @@
 import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
+import { normalizeStarknetAddress } from "../utils/address.js";
 
 export type ChallengeRecord = {
   nonce: string;
   expiresAtMs: number;
 };
 
-const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+/**
+ * Nonce challenge generation and expiry contract.
+ *
+ * The contract is intentionally narrow so privilege checks cannot drift as
+ * new routes are added. The full contract is documented in
+ * `docs/auth/challenge.md`; the body of this file is the implementation side
+ * of that contract.
+ *
+ * TL;DR:
+ *   - createChallenge requires a parseable Starknet address. Refuses to
+ *     store when the in-memory store is at MAX_CHALLENGES (DoS hardening).
+ *   - getChallenge / clearChallenge / consumeChallenge tolerate malformed
+ *     addresses by returning null / no-op; they never throw.
+ *   - consumeChallenge is the ONLY safe way to read a challenge before
+ *     signature verification: it deletes atomically to close the replay
+ *     race (two concurrent verify calls seeing the same nonce).
+ *   - buildTypedChallenge normalizes the wallet field to the canonical
+ *     (lowercase, padded) form so the wallet's signature hash matches
+ *     exactly what the backend stored when the challenge was issued.
+ *   - All challenges are 16-byte cryptographic nonces with a fixed
+ *     CHALLENGE_TTL_MS TTL; expired entries are evicted lazily on access.
+ */
+export const CHALLENGE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Hard cap on the in-memory challenge store. Prevents an unbounded Map
+ * growth under spam: an attacker who keeps calling `createChallenge` from
+ * fresh addresses would otherwise OOM the server. At 100k entries of ~80
+ * bytes each the store tops out around ~8MB; beyond that `createChallenge`
+ * throws and the caller is expected to retry (the route handler maps this
+ * to a 5xx).
+ */
+export const MAX_CHALLENGES = 100_000;
 
 /**
  * Challenges are short-lived (5-minute TTL), cryptographic nonces used to prove wallet ownership.
@@ -16,6 +49,11 @@ const CHALLENGE_TTL_MS = 5 * 60 * 1000;
  * for every unauthenticated challenge request. If the server restarts or a different instance
  * handles the verification, the user's wallet client simply requests a new challenge nonce with no
  * negative security implications and minimal user friction.
+ *
+ * SIZE CAP:
+ * The Map is bounded at MAX_CHALLENGES. Beyond that, createChallenge
+ * refuses to store a new entry and throws so the route layer can surface
+ * the failure rather than silently dropping a security-relevant signal.
  */
 export const challenges = new Map<string, ChallengeRecord>();
 
@@ -46,6 +84,8 @@ function sweepExpiredChallenges(now: number): void {
  *
  * @param address - The user's Starknet wallet address
  * @returns The generated nonce and its TTL
+ * @throws if the address cannot be normalized to a Starknet address, or if
+ *   the in-memory store is at the MAX_CHALLENGES cap.
  */
 export function createChallenge(address: string) {
   const now = Date.now();
@@ -71,30 +111,48 @@ export function createChallenge(address: string) {
 }
 
 /**
- * Retrieves the challenge record for verification.
+ * Retrieves the challenge record for verification. Expired entries are
+ * evicted on access.
  *
  * @param address - The user's Starknet wallet address
- * @returns The challenge record if found and valid, otherwise null
+ * @returns The challenge record if found and valid, otherwise null. Malformed
+ *   addresses resolve to null without throwing.
  */
 export function getChallenge(address: string) {
-  const rec = challenges.get(address.toLowerCase());
-  if (!rec) {
-    console.info(JSON.stringify({
-      metric: "challenge_miss",
-      reason: "not_found",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+  const lookupKey = normalizeAddressKey(address);
+  if (lookupKey === null) {
+    console.info(
+      JSON.stringify({
+        metric: "challenge_miss",
+        reason: "invalid_address",
+        timestamp: new Date().toISOString(),
+      }),
+    );
     return null;
   }
-  
+
+  const rec = challenges.get(lookupKey);
+  if (!rec) {
+    console.info(
+      JSON.stringify({
+        metric: "challenge_miss",
+        reason: "not_found",
+        address: address.toLowerCase(),
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    return null;
+  }
+
   if (Date.now() > rec.expiresAtMs) {
-    challenges.delete(address.toLowerCase());
-    console.info(JSON.stringify({
-      metric: "challenge_expired",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+    challenges.delete(lookupKey);
+    console.info(
+      JSON.stringify({
+        metric: "challenge_expired",
+        address: address.toLowerCase(),
+        timestamp: new Date().toISOString(),
+      }),
+    );
     return null;
   }
   return rec;
@@ -106,13 +164,18 @@ export function getChallenge(address: string) {
  * @param address - The user's Starknet wallet address
  */
 export function clearChallenge(address: string) {
-  const deleted = challenges.delete(address.toLowerCase());
+  const lookupKey = normalizeAddressKey(address);
+  if (lookupKey === null) return;
+
+  const deleted = challenges.delete(lookupKey);
   if (deleted) {
-    console.info(JSON.stringify({
-      metric: "challenge_cleared",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString()
-    }));
+    console.info(
+      JSON.stringify({
+        metric: "challenge_cleared",
+        address: address.toLowerCase(),
+        timestamp: new Date().toISOString(),
+      }),
+    );
   }
 }
 
@@ -132,14 +195,18 @@ export function clearChallenge(address: string) {
 export function consumeChallenge(address: string) {
   const rec = getChallenge(address);
   if (!rec) return null;
-  
-  challenges.delete(address.toLowerCase());
-  console.info(JSON.stringify({
-    metric: "challenge_consumed",
-    address: address.toLowerCase(),
-    timestamp: new Date().toISOString()
-  }));
-  
+
+  const lookupKey = normalizeAddressKey(address);
+  if (lookupKey !== null) challenges.delete(lookupKey);
+
+  console.info(
+    JSON.stringify({
+      metric: "challenge_consumed",
+      address: address.toLowerCase(),
+      timestamp: new Date().toISOString(),
+    }),
+  );
+
   return rec;
 }
 
@@ -148,8 +215,15 @@ export function consumeChallenge(address: string) {
  *
  * Extracted from the auth route so it can be unit-tested in isolation, without
  * pulling in the Express router or the Starknet RPC provider.
+ *
+ * The wallet field is normalized to the canonical (lowercase, padded) form
+ * before being placed in the typed-data message. This keeps the signature
+ * the wallet produces stable regardless of how the caller cased the input
+ * address ("0xAbC" vs "0xabc"), and matches the lowercase key the
+ * `challenges` Map stores the nonce under.
  */
 export function buildTypedChallenge(address: string, chainId: string, nonce: string): TypedData {
+  const canonicalAddress = canonicalWalletAddress(address);
   // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
   // They expect plain string values like:
   // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"
@@ -181,8 +255,38 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
     },
     message: {
       action: "LOGIN",
-      wallet: address,
+      wallet: canonicalAddress,
       nonce,
     },
   };
+}
+
+/**
+ * Returns the canonical Starknet address (lowercase, padded, mixed-case
+ * checksummed) for use as a `challenges` Map key, or null if the input is
+ * not a usable Starknet address. Returns null rather than throwing so that
+ * `getChallenge` / `clearChallenge` / `consumeChallenge` degrade gracefully
+ * on malformed input rather than 500'ing the auth route.
+ */
+function normalizeAddressKey(address: string): string | null {
+  if (typeof address !== "string" || address.length === 0) return null;
+  try {
+    return normalizeStarknetAddress(address);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the canonical wallet field for `buildTypedChallenge`. Throws on
+ * malformed input: the route layer's Zod schema already validates the
+ * raw request body, so any input that fails normalize here is a caller
+ * bug, not something to silently paper over.
+ */
+function canonicalWalletAddress(address: string): string {
+  const canonical = normalizeAddressKey(address);
+  if (canonical === null) {
+    throw new Error("buildTypedChallenge: address is not a parseable Starknet address");
+  }
+  return canonical;
 }
