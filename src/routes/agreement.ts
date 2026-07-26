@@ -1065,19 +1065,53 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
   }
 });
 
+// -------- query-param schemas for agreement listing --------
+
+/** Maximum agreements returned per page. Clamped server-side regardless of client input. */
+const LIST_MAX_LIMIT = 100;
+
+/** Default page size when the caller omits the limit parameter. */
+const LIST_DEFAULT_LIMIT = 50;
+
+const ListAgreementsQuery = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .catch(LIST_DEFAULT_LIMIT),
+  cursor: z.string().optional(),
+  status: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(5)
+    .optional(),
+});
+
 // List all agreements for a user (as employer or contributor/employee)
 agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
     const userAddress = normalizeStarknetAddress(req.params.user_address);
 
+    // Parse and clamp query params
+    const rawQuery = ListAgreementsQuery.parse(req.query);
+    const limit = Math.min(Math.max(rawQuery.limit, 1), LIST_MAX_LIMIT);
+    const cursor = rawQuery.cursor ?? null;
+    const statusFilter = rawQuery.status ?? null;
+
     console.log(
-      `[list-agreements] Querying database for agreements for user: ${userAddress} in contract: ${address}`,
+      `[list-agreements] Querying database for agreements for user: ${userAddress} in contract: ${address}` +
+        ` limit=${limit} cursor=${cursor ?? "none"} status=${statusFilter ?? "none"}`,
     );
 
     // ONLY USE DATABASE - No contract scanning, no in-memory cache, no fallbacks
     try {
-      // Get agreements where user is employer or contributor
+      // Build filter predicates inline so spread satisfies drizzle's SQLWrapper signature.
+      const cursorFilter = cursor !== null ? [lt(schema.agreements.id, cursor)] : [];
+      const statusConstraint =
+        statusFilter !== null ? [eq(schema.agreements.status, statusFilter)] : [];
+
+      // Fetch limit + 1 to determine hasMore
       const indexedAgreements = await db
         .select()
         .from(schema.agreements)
@@ -1088,9 +1122,12 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
               eq(schema.agreements.employer, userAddress),
               eq(schema.agreements.contributor, userAddress),
             ),
+            ...cursorFilter,
+            ...statusConstraint,
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt), desc(schema.agreements.id))
+        .limit(limit + 1);
 
       // Also check if user is an employee in any payroll agreements
       const employeeAgreements = await db
@@ -1104,25 +1141,37 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
             eq(schema.agreements.contractAddress, address),
             eq(schema.employees.employeeAddress, userAddress),
             eq(schema.agreements.mode, 1), // Payroll mode
+            ...cursorFilter,
+            ...statusConstraint,
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt), desc(schema.agreements.id))
+        .limit(limit + 1);
 
       // Combine and deduplicate
       const allAgreements = [...indexedAgreements, ...employeeAgreements.map((e) => e.agreement)];
 
-      // Remove duplicates by agreement ID
-      const uniqueAgreementsMap = new Map<string, any>();
-      allAgreements.forEach((a) => {
-        uniqueAgreementsMap.set(a.id, a);
-      });
+      // Remove duplicates by agreement ID while preserving order (first occurrence wins)
+      const seen = new Set<string>();
+      const uniqueAgreements: typeof indexedAgreements = [];
+      for (const a of allAgreements) {
+        if (!seen.has(a.id)) {
+          seen.add(a.id);
+          uniqueAgreements.push(a);
+        }
+      }
 
-      const uniqueAgreements = Array.from(uniqueAgreementsMap.values());
+      const hasMore = uniqueAgreements.length > limit;
+      const page = uniqueAgreements.slice(0, limit);
+      const nextCursor: string | null =
+        page.length > 0 && hasMore ? page[page.length - 1].id : null;
 
-      console.log(`[list-agreements] Found ${uniqueAgreements.length} agreements from database`);
+      console.log(
+        `[list-agreements] Found ${uniqueAgreements.length} agreements (page=${page.length}, hasMore=${hasMore})`,
+      );
 
       return res.json({
-        agreements: uniqueAgreements.map((a) => ({
+        agreements: page.map((a) => ({
           agreement_id: a.id,
           employer: a.employer,
           contributor: a.contributor,
@@ -1132,6 +1181,9 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
           paid_amount: a.paidAmount,
         })),
         source: "indexed",
+        limit,
+        cursor: nextCursor,
+        hasMore,
       });
     } catch (dbError) {
       console.error(`[list-agreements] Database query failed:`, dbError);
