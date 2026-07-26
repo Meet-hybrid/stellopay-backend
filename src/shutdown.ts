@@ -39,24 +39,27 @@ export function setupGracefulShutdown(
 
     currentPhase = "server_close";
     console.log("[shutdown] Stopping HTTP server from accepting new connections...");
-    server.close(async (err) => {
-      if (err) {
-        console.error("[shutdown] Error during server close:", err);
-      } else {
-        console.log("[shutdown] HTTP server closed");
-      }
-
-      currentPhase = "pool_close";
-      try {
-        await closePool();
-        clearTimeout(timeout);
-        console.log("[shutdown] Graceful shutdown complete, exiting (0)");
-        process.exit(0);
-      } catch (poolErr) {
-        console.error("[shutdown] Error closing pool:", poolErr);
-        process.exit(1);
-      }
+    await new Promise<void>((resolve) => {
+      server.close((err) => {
+        if (err) {
+          console.error("[shutdown] Error during server close:", err);
+        } else {
+          console.log("[shutdown] HTTP server closed");
+        }
+        resolve();
+      });
     });
+
+    currentPhase = "pool_close";
+    try {
+      await closePool();
+      clearTimeout(timeout);
+      console.log("[shutdown] Graceful shutdown complete, exiting (0)");
+      process.exit(0);
+    } catch (poolErr) {
+      console.error("[shutdown] Error closing pool:", poolErr);
+      process.exit(1);
+    }
   };
 
   process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
