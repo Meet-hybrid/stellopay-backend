@@ -1,11 +1,8 @@
 import { Router } from "express";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
-import {
-  StarknetAddress,
-  AgreementId,
-  parsePagination,
-} from "../utils/validation.js";
+import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const indexedRouter = Router();
 
@@ -57,7 +54,7 @@ indexedRouter.get(
 
       // Remove duplicates by agreement ID, then bound the combined result.
       const uniqueAgreements = Array.from(
-        new Map(allAgreements.map((a) => [a.id, a])).values()
+        new Map(allAgreements.map((a) => [a.id, a])).values(),
       ).slice(0, limit);
 
       res.json({
@@ -89,7 +86,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       .limit(1);
 
     if (agreement.length === 0) {
-      res.status(404).json({ error: "Agreement not found" });
+      notFoundResponse(res, "Agreement not found");
       return;
     }
 

@@ -523,6 +523,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
 
     expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false });
     expect(res.body.error).toMatch(/not found/i);
   });
 
