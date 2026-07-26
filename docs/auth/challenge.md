@@ -1,125 +1,56 @@
-# Challenge — nonce typed-data builder
+# Challenge Nonce Contract
 
-Source: [`src/auth/challenge.ts`](../../src/auth/challenge.ts)
+This document is the authoritative contract for `src/auth/challenge.ts`. It
+describes the nonce-challenge generation, expiry, and typed-data boundary
+that `src/routes/auth.ts` relies on for wallet-ownership proof. Read this
+before adding or moving an auth route that touches challenges.
 
-## Overview
+The implementation in `src/auth/challenge.ts` mirrors this contract line
+for line; if the two files ever disagree, this document is the source of
+truth and the implementation needs fixing.
 
-`challenge.ts` owns one job: constructing the SNIP-12 typed-data object that a
-Starknet wallet (ArgentX, Braavos, Ready) signs to prove address ownership. It
-is called by two routes in `src/routes/auth.ts`:
+## Why this exists
 
-| Route | Purpose |
-|---|---|
-| `POST /auth/challenge` | Issue a nonce; return typed data for the wallet to sign |
-| `POST /auth/verify` | Rebuild typed data to verify the submitted signature |
+The wallet-login flow has three trust-bearing primitives:
 
----
+1. The server-issued nonce — proves a wallet signed _for this request_,
+   not an old session.
+2. The nonce's TTL — closes the window where a stolen nonce can be replayed.
+3. The typed-data payload — must match byte-for-byte what the wallet sees
+   so the wallet's signature verifies against the same payload the
+   backend recorded.
 
-## Public API
+## Rationale for In-Memory Retention
+Challenges are highly transient. Storing them in-memory avoids unnecessary database read/write overhead for every unauthenticated challenge request. If the server restarts, the user's wallet client simply requests a new challenge nonce with no negative security implications and minimal friction.
 
-### `buildTypedChallenge(address, chainId, nonce)`
+## Bounding memory growth (expired-challenge sweep)
 
-Returns a SNIP-12 `TypedData` object.
+`getChallenge` and `consumeChallenge` only evict an entry when it is *read* —
+an address that requests a challenge and never calls `/auth/verify` (an
+abandoned login, or an attacker enumerating addresses) would otherwise sit in
+the in-memory map forever, growing it without bound.
 
-```ts
-import { buildTypedChallenge } from "./auth/challenge.js";
+`createChallenge` guards against this with a lightweight, opportunistic sweep:
+every 50th call scans the map and deletes any entry whose TTL has already
+elapsed, regardless of whether it was ever read. This bounds unread/abandoned
+entries to roughly one sweep interval's worth of traffic instead of the
+lifetime of the process, without requiring a background timer (which would
+complicate shutdown and test lifecycles).
 
-const typedData = buildTypedChallenge(address, chainId, nonce);
-// → pass to provider.verifyMessageInStarknet(typedData, signature, address)
-```
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `address` | `string` | Wallet address that will sign the challenge |
-| `chainId` | `string` | Encoded felt from the Starknet RPC (e.g. result of `encodeShortString("SN_SEPOLIA")`) |
-| `nonce` | `string` | Unique per-challenge nonce from `createChallenge` |
-
-**Returns** — a `TypedData` object with:
-- `types` — shared module-level constant (never re-allocated per call)
-- `primaryType: "Challenge"`
-- `domain` — `StelloPay / v1 / <chainId label> / revision 1`
-- `message` — `{ action: "LOGIN", wallet: address, nonce }`
-
----
-
-### `getChainIdLabel(chainId)`
-
-Decodes an encoded chain-ID felt to its human-readable label, with memoisation.
-
-```ts
-getChainIdLabel(encodeShortString("SN_SEPOLIA")) // → "SN_SEPOLIA"
-getChainIdLabel(encodeShortString("SN_MAIN"))    // → "SN_MAIN"
-```
-
-The result is cached in a module-level `Map` keyed by the encoded felt. Because
-the chain ID is fixed for the lifetime of the process (sourced from
-`getCachedNetworkInfo`), the decode only ever runs once per unique felt value.
-
----
-
-### `clearChainIdCache()`
-
-Clears the chain-ID decode cache. **Test use only** — production code must not
-call this.
-
----
-
-## Performance design
-
-Two sources of repeated work existed before this change:
-
-### 1. `shortString.decodeShortString` on every request
-
-`buildTypedChallenge` was calling `decodeShortString(chainId)` on every
-`/auth/challenge` and `/auth/verify` request. The chain ID felt is constant for
-the process lifetime; the decode result never varies. It is now cached in
-`chainIdCache` via `getChainIdLabel` so the decode runs at most once per unique
-felt.
-
-### 2. `CHALLENGE_TYPES` re-allocated on every call
-
-The `types` object (SNIP-12 field descriptors for `StarknetDomain` and
-`Challenge`) was an object literal inside the function body, causing a fresh
-allocation on every call even though the value never changes. It is now a
-module-level constant. The test `"shares the same types object reference across
-calls"` verifies referential equality (`toBe`) to guard against regression.
-
-### What changes per call
-
-Only two fields actually vary between invocations:
-- `message.wallet` — the requester's address
-- `message.nonce` — the per-challenge nonce
-
-Everything else (`types`, `primaryType`, `domain`) is either constant or
-derived from the cached chain-ID label.
-
----
-
-## Wallet compatibility notes
-
-ArgentX, Braavos, and Ready all validate typed data against the SNIP-12 JSON
-schema. They expect:
-
-- `domain.chainId` — plain decoded string (`"SN_SEPOLIA"` / `"SN_MAIN"`), not
-  the raw felt hex.
-- `domain.revision: "1"` — required by Ready; harmless for the other wallets.
-- `message.action`, `message.wallet`, `message.nonce` — all `felt`-typed
-  plain strings.
-
-starknet.js encodes these to felts internally when computing the hash for
-`verifyMessageInStarknet`.
-
----
+This is a best-effort bound, not a hard guarantee — growth between sweeps
+scales with the volume of `/auth/challenge` traffic in that window. It is out
+of scope for this change to replace the sweep with a stricter bound (e.g. a
+max map size with eviction) or a background timer; see "Out of scope" below.
 
 ## Out of scope
-
-- **Nonce generation and expiry** — owned by `src/auth/session.ts`
-  (`createChallenge`, `consumeChallenge`).
-- **Signature verification** — performed by
-  `provider.verifyMessageInStarknet` in `src/routes/auth.ts`; `challenge.ts`
-  only builds the typed-data structure.
-- **Multiple domain versions** — the domain is fixed at `version: "1"` /
-  `revision: "1"`. Supporting future SNIP-12 revisions would require a new
-  builder or a version parameter.
+- **Hard upper bound / max-size eviction** — the sweep bounds growth
+  opportunistically but does not cap the map at a fixed size. Under sustained,
+  very high-volume abuse between sweeps, memory usage could still spike before
+  the next sweep runs.
+- **Background timer-based cleanup** — deliberately not used, to avoid a
+  persistent timer complicating process shutdown and test isolation.
+- **Idempotent re-issuance for the same address** — calling `createChallenge`
+  again for an address that already has an active, unexpired challenge mints
+  and stores a brand-new nonce (overwriting the old one) rather than reusing
+  the existing one. This matches the existing lazy-refresh design and is
+  unchanged by this update.
