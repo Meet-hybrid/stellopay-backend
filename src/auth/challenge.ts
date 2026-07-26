@@ -58,6 +58,28 @@ export const MAX_CHALLENGES = 100_000;
 export const challenges = new Map<string, ChallengeRecord>();
 
 /**
+ * Number of `createChallenge` calls between opportunistic sweeps of expired entries.
+ *
+ * `getChallenge`/`consumeChallenge` only evict an entry when it is *read*, so an
+ * address that requests a challenge and never follows up with `/auth/verify`
+ * (an abandoned login, or an attacker enumerating addresses) would otherwise sit
+ * in `challenges` forever, growing the map without bound. Sweeping periodically
+ * on the write path bounds that growth without needing a background timer,
+ * which would complicate shutdown and test lifecycles.
+ */
+const SWEEP_INTERVAL = 50;
+let creationsSinceSweep = 0;
+
+/** Removes all entries whose TTL has already elapsed as of `now`. */
+function sweepExpiredChallenges(now: number): void {
+  for (const [key, rec] of challenges) {
+    if (now > rec.expiresAtMs) {
+      challenges.delete(key);
+    }
+  }
+}
+
+/**
  * Generates a challenge nonce for verification.
  *
  * @param address - The user's Starknet wallet address
@@ -66,27 +88,24 @@ export const challenges = new Map<string, ChallengeRecord>();
  *   the in-memory store is at the MAX_CHALLENGES cap.
  */
 export function createChallenge(address: string) {
-  const lookupKey = normalizeAddressKey(address);
-  if (lookupKey === null) {
-    throw new Error("createChallenge: address is not a parseable Starknet address");
-  }
-  if (challenges.size >= MAX_CHALLENGES) {
-    throw new Error("createChallenge: challenge store is full");
-  }
-  const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
-  challenges.set(lookupKey, { nonce, expiresAtMs: Date.now() + CHALLENGE_TTL_MS });
+  const now = Date.now();
 
-  // Structured log/metric for challenge generation. Address is the
-  // lowercased raw input (matches what the route layer received from
-  // req.body); the Map key is the canonical form.
-  console.info(
-    JSON.stringify({
-      metric: "challenge_created",
-      address: address.toLowerCase(),
-      expires_in_ms: CHALLENGE_TTL_MS,
-      timestamp: new Date().toISOString(),
-    }),
-  );
+  creationsSinceSweep += 1;
+  if (creationsSinceSweep >= SWEEP_INTERVAL) {
+    creationsSinceSweep = 0;
+    sweepExpiredChallenges(now);
+  }
+
+  const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
+  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: now + CHALLENGE_TTL_MS });
+
+  // Structured log/metric for challenge generation
+  console.info(JSON.stringify({
+    metric: "challenge_created",
+    address: address.toLowerCase(),
+    expires_in_ms: CHALLENGE_TTL_MS,
+    timestamp: new Date().toISOString()
+  }));
 
   return { nonce, expires_in_ms: CHALLENGE_TTL_MS };
 }

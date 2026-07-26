@@ -11,9 +11,12 @@ import {
   SESSION_GAUGES,
   type SessionRejectionReason,
 } from "./session-metrics.js";
+import { withBoundedRetry } from "./session-retry.js";
 
 const SESSION_TTL_MS = env.SESSION_TTL_MS;
 const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
+// Do not write to DB to update lastSeen/expiresAt if it was updated less than 1 minute ago.
+const SESSION_UPDATE_THRESHOLD_MS = 60 * 1000;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -121,13 +124,20 @@ export async function requireSession(address: string, token: string): Promise<bo
       nextExpiresAtMs = session.absoluteExpiresAt.getTime();
     }
 
-    await db
-      .update(sessionsTable)
-      .set({
-        lastSeen: now,
-        expiresAt: new Date(nextExpiresAtMs),
-      })
-      .where(eq(sessionsTable.tokenHash, tokenHash));
+    // Only update database if lastSeen is not set or threshold has elapsed to reduce repeated write I/O
+    const shouldUpdate =
+      !session.lastSeen ||
+      (now.getTime() - session.lastSeen.getTime() >= SESSION_UPDATE_THRESHOLD_MS);
+
+    if (shouldUpdate) {
+      await db
+        .update(sessionsTable)
+        .set({
+          lastSeen: now,
+          expiresAt: new Date(nextExpiresAtMs),
+        })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+    }
 
     incSessionMetric(SESSION_METRICS.VALIDATED);
     logSessionEvent("debug", "session.validated", {
@@ -155,6 +165,26 @@ export async function requireSession(address: string, token: string): Promise<bo
  * token is treated as a no-op (no log, no metric) so callers can safely
  * invoke this from middleware that has already validated the token.
  *
+ * RELIABILITY (issue #125):
+ *   1. Idempotent re-revoke detection — if the row already has a non-null
+ *      `revokedAt`, an extra `session.revoke_already` log + bump of
+ *      `session_revoke_already_total` is emitted and the function
+ *      returns early. The retry/update loop is skipped, so the
+ *      `session_revoked_total` counter is NOT incremented on a
+ *      re-call. This keeps dashboards from inflating the
+ *      `session_revoked_total` counter when a chatty client retries the
+ *      same logout.
+ *   2. Bounded retry — the underlying update is wrapped in
+ *      {@link withBoundedRetry} (3 attempts, 50ms delay) so transient
+ *      Postgres blips don't surface as 5xx to the caller. Retrying
+ *      UPDATE … SET revokedAt = now() is safe because the column write
+ *      is idempotent (writing the same value twice produces the same
+ *      final state). Each retry emits `session.revoke_retry` and bumps
+ *      `session_revoke_retry_total`. After the final attempt, an
+ *      `session.revoke_failed` error log + bump of
+ *      `session_revoke_failed_total` is emitted and the error is
+ *      rethrown so the route handler can return a 5xx.
+ *
  * @param token - The raw session token to revoke
  */
 export async function revokeSession(token: string): Promise<void> {
@@ -163,10 +193,55 @@ export async function revokeSession(token: string): Promise<void> {
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const tokenHashShort = tokenHash.slice(0, 8);
 
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
+  // Read first: classifies the call as "already revoked" vs "first revoke".
+  // We only run this lookup once before the retry loop so that the same
+  // idempotent re-revoke classification holds across retries.
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+    });
+    // Already revoked — skip the retry/update loop AND the REVOKED bump
+    // so that `session_revoked_total` reflects distinct revocations only.
+    // The retry loop's UPDATE is redundant (the column is already non-null)
+    // and would otherwise double-bump the success metrics on every re-call.
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.tokenHash, tokenHash)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "single",
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          token_hash_prefix: tokenHashShort,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.REVOKED);
   logSessionEvent("info", "session.revoked", {
@@ -206,75 +281,99 @@ export async function rotateSession(address: string, token: string): Promise<Rot
   const now = new Date();
   const normalizedAddress = address.toLowerCase();
 
-  const [session] = await db
-    .select()
-    .from(sessionsTable)
-    .where(eq(sessionsTable.tokenHash, tokenHash))
-    .limit(1);
+  try {
+    return await db.transaction(async (tx) => {
+      const [session] = await tx
+        .select()
+        .from(sessionsTable)
+        .where(eq(sessionsTable.tokenHash, tokenHash))
+        .for("update")
+        .limit(1);
 
-  if (!session || session.address !== normalizedAddress) {
-    recordRejection(session ? "address_mismatch" : "unknown_token", address);
-    return { ok: false, reason: "invalid" };
-  }
+      if (!session || session.address !== normalizedAddress) {
+        recordRejection(session ? "address_mismatch" : "unknown_token", address);
+        return { ok: false, reason: "invalid" };
+      }
 
-  // Fallback for rows created before this migration: treat the token itself
-  // as the root of its own family so future rotations still chain correctly.
-  const familyId = session.familyId ?? session.tokenHash;
+      // Fallback for rows created before this migration: treat the token itself
+      // as the root of its own family so future rotations still chain correctly.
+      const familyId = session.familyId ?? session.tokenHash;
 
-  if (session.rotatedAt !== null || session.revokedAt !== null) {
-    await revokeFamily(familyId);
-    incSessionMetric(SESSION_METRICS.REUSE_DETECTED);
-    logSessionEvent("warn", "session.reuse_detected", {
-      address: normalizedAddress,
-      family_id: familyId,
-      had_rotated_at: session.rotatedAt !== null,
-      had_revoked_at: session.revokedAt !== null,
+      if (session.rotatedAt !== null || session.revokedAt !== null) {
+        // Inline family revocation for transaction safety, replicating revokeFamily telemetry
+        await tx
+          .update(sessionsTable)
+          .set({ revokedAt: now })
+          .where(eq(sessionsTable.familyId, familyId));
+          
+        incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
+        logSessionEvent("warn", "session.family_revoked", {
+          family_id: familyId,
+        });
+
+        incSessionMetric(SESSION_METRICS.REUSE_DETECTED);
+        logSessionEvent("warn", "session.reuse_detected", {
+          address: normalizedAddress,
+          family_id: familyId,
+          had_rotated_at: session.rotatedAt !== null,
+          had_revoked_at: session.revokedAt !== null,
+        });
+        
+        return { ok: false, reason: "reused", familyId };
+      }
+
+      if (
+        session.expiresAt.getTime() < now.getTime() ||
+        session.absoluteExpiresAt.getTime() < now.getTime()
+      ) {
+        recordRejection(
+          session.absoluteExpiresAt.getTime() < now.getTime() ? "expired_absolute" : "expired_sliding",
+          address,
+        );
+        return { ok: false, reason: "invalid" };
+      }
+
+      const newToken = crypto.randomBytes(24).toString("hex");
+      const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
+      const nowMs = now.getTime();
+      let newExpiresAtMs = nowMs + SESSION_TTL_MS;
+      if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
+        newExpiresAtMs = session.absoluteExpiresAt.getTime();
+      }
+
+      // Issue the replacement before marking the old one rotated, so a failure
+      // here leaves the old token intact instead of orphaning the session.
+      await tx.insert(sessionsTable).values({
+        tokenHash: newTokenHash,
+        address: session.address,
+        familyId,
+        expiresAt: new Date(newExpiresAtMs),
+        absoluteExpiresAt: session.absoluteExpiresAt,
+      });
+
+      await tx
+        .update(sessionsTable)
+        .set({ rotatedAt: now })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+
+      incSessionMetric(SESSION_METRICS.ROTATED);
+      logSessionEvent("info", "session.rotated", {
+        address: normalizedAddress,
+        family_id: familyId,
+        expires_in_ms: newExpiresAtMs - nowMs,
+      });
+
+      return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
     });
-    return { ok: false, reason: "reused", familyId };
-  }
-
-  if (
-    session.expiresAt.getTime() < now.getTime() ||
-    session.absoluteExpiresAt.getTime() < now.getTime()
-  ) {
-    recordRejection(
-      session.absoluteExpiresAt.getTime() < now.getTime() ? "expired_absolute" : "expired_sliding",
-      address,
-    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REJECTED);
+    logSessionEvent("error", "session.rejected", {
+      reason: "db_error",
+      operation: "rotate",
+      error: error instanceof Error ? error.message : String(error),
+    });
     return { ok: false, reason: "invalid" };
   }
-
-  const newToken = crypto.randomBytes(24).toString("hex");
-  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
-  const nowMs = now.getTime();
-  let newExpiresAtMs = nowMs + SESSION_TTL_MS;
-  if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
-    newExpiresAtMs = session.absoluteExpiresAt.getTime();
-  }
-
-  // Issue the replacement before marking the old one rotated, so a failure
-  // here leaves the old token intact instead of orphaning the session.
-  await db.insert(sessionsTable).values({
-    tokenHash: newTokenHash,
-    address: session.address,
-    familyId,
-    expiresAt: new Date(newExpiresAtMs),
-    absoluteExpiresAt: session.absoluteExpiresAt,
-  });
-
-  await db
-    .update(sessionsTable)
-    .set({ rotatedAt: now })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
-
-  incSessionMetric(SESSION_METRICS.ROTATED);
-  logSessionEvent("info", "session.rotated", {
-    address: normalizedAddress,
-    family_id: familyId,
-    expires_in_ms: newExpiresAtMs - nowMs,
-  });
-
-  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
 }
 
 /**
@@ -283,13 +382,57 @@ export async function rotateSession(address: string, token: string): Promise<Rot
  *
  * Emits `session.family_revoked` (warn) and bumps `session_family_revoked_total`.
  *
+ * RELIABILITY (issue #125): see {@link revokeSession} — the same idempotent
+ * re-revoke classification + bounded-retry policy applies here.
+ *
  * @param familyId - The token family identifier
  */
 export async function revokeFamily(familyId: string): Promise<void> {
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.familyId, familyId));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.familyId, familyId))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.FAMILY_REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "family",
+      family_id: familyId,
+    });
+    // Already revoked — skip the retry/update loop AND the FAMILY_REVOKED
+    // bump so that `session_family_revoked_total` reflects distinct family
+    // revocations only.
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.familyId, familyId)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "family",
+          family_id: familyId,
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "family",
+      family_id: familyId,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
   logSessionEvent("warn", "session.family_revoked", {
@@ -304,14 +447,58 @@ export async function revokeFamily(familyId: string): Promise<void> {
  *
  * Emits `session.all_revoked` (info) and bumps `session_all_revoked_total`.
  *
+ * RELIABILITY (issue #125): see {@link revokeSession} — the same idempotent
+ * re-revoke classification + bounded-retry policy applies here.
+ *
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
   const normalizedAddress = address.toLowerCase();
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.address, normalizedAddress));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.address, normalizedAddress))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.ALL_REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "all",
+      address: normalizedAddress,
+    });
+    // Already revoked — skip the retry/update loop AND the ALL_REVOKED
+    // bump so that `session_all_revoked_total` reflects distinct address
+    // revocations only.
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.address, normalizedAddress)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "all",
+          address: normalizedAddress,
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "all",
+      address: normalizedAddress,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.ALL_REVOKED);
   logSessionEvent("info", "session.all_revoked", {
@@ -327,22 +514,44 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
  * `session.sweep_failed` (error) on DB error and bumps
  * `session_sweeper_errors_total`.
  *
+ * RELIABILITY (issue #125): the DELETE is wrapped in
+ * {@link withBoundedRetry} (3 attempts, 50ms delay) so a single transient
+ * Postgres blip doesn't leave the sweeper running on an empty result set.
+ * Retrying DELETE … WHERE … with the same predicate is idempotent at the
+ * SQL level — the second attempt just deletes fewer rows. Each retry
+ * emits `session.sweep_retry` (warn) and bumps
+ * `session_sweep_retry_total`. If all attempts fail, the existing
+ * `session.sweep_failed` path keeps running so the periodic sweeper
+ * stays self-healing on the next tick.
+ *
  * @param now - Optional timestamp override (default Date.now())
  * @returns A promise resolving to the number of rows deleted
  */
 export async function sweepExpiredSessions(now: number = Date.now()): Promise<number> {
   const nowDate = new Date(now);
   try {
-    const deleted = await db
-      .delete(sessionsTable)
-      .where(
-        or(
-          lt(sessionsTable.expiresAt, nowDate),
-          lt(sessionsTable.absoluteExpiresAt, nowDate),
-          isNotNull(sessionsTable.revokedAt),
-        ),
-      )
-      .returning({ tokenHash: sessionsTable.tokenHash });
+    const deleted = await withBoundedRetry(
+      () =>
+        db
+          .delete(sessionsTable)
+          .where(
+            or(
+              lt(sessionsTable.expiresAt, nowDate),
+              lt(sessionsTable.absoluteExpiresAt, nowDate),
+              isNotNull(sessionsTable.revokedAt),
+            ),
+          )
+          .returning({ tokenHash: sessionsTable.tokenHash }),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.SWEEP_RETRY);
+        logSessionEvent("warn", "session.sweep_retry", {
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          message: errorMessage(info.error),
+        });
+      },
+    );
     const count = deleted.length;
     incSessionMetric(SESSION_METRICS.SWEEP_RUNS);
     incSessionMetric(SESSION_METRICS.SWEEP_DELETED, count);
