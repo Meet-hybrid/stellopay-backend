@@ -110,6 +110,8 @@ vi.mock("../db/index.js", () => {
         blockNumber: "blockNumber",
         createdAt: "createdAt",
         agreementId: "agreementId",
+        contractAddress: "contractAddress",
+        transactionHash: "transactionHash",
         id: "id",
         contractAddress: "contractAddress",
         transactionHash: "transactionHash",
@@ -119,6 +121,9 @@ vi.mock("../db/index.js", () => {
         blockNumber: "blockNumber",
         createdAt: "createdAt",
         agreementId: "agreementId",
+        contractAddress: "contractAddress",
+        transactionHash: "transactionHash",
+        salaryPerPeriod: "salaryPerPeriod",
         id: "id",
         contractAddress: "contractAddress",
         transactionHash: "transactionHash",
@@ -128,6 +133,9 @@ vi.mock("../db/index.js", () => {
         blockNumber: "blockNumber",
         createdAt: "createdAt",
         agreementId: "agreementId",
+        contractAddress: "contractAddress",
+        transactionHash: "transactionHash",
+        amount: "amount",
         id: "id",
         contractAddress: "contractAddress",
         transactionHash: "transactionHash",
@@ -473,6 +481,7 @@ describe("Transactions Router — logging", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    mockAuthResult = { address: userAddress, token: "test-token" };
 
     const { db } = await import("../db/index.js");
     vi.mocked(db.select).mockImplementation((arg: any) => {

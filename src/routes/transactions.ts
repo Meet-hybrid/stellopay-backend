@@ -103,6 +103,36 @@ export interface TransactionExport {
   offset: number;
 }
 /**
+ * Explicit allowlist of every event-type value that may appear in the
+ * `eventTypes` query parameter. Values outside this set are rejected before
+ * they reach any DB call, so callers cannot inject arbitrary strings into
+ * the `inArray()` filter or probe for unknown table values.
+ */
+const ALLOWED_EVENT_TYPES = new Set([
+  // WorkAgreement events
+  "AgreementCreated",
+  "AgreementActivated",
+  "AgreementPaused",
+  "AgreementResumed",
+  "AgreementCancelled",
+  "AgreementCompleted",
+  "AgreementStatusChange",
+  "PaymentSent",
+  "PaymentReceived",
+  "MilestoneAdded",
+  "MilestoneApproved",
+  "MilestoneClaimed",
+  "EmployeeAdded",
+  "PayrollClaimed",
+  "DisputeRaised",
+  "DisputeResolved",
+  // PayrollEscrow events
+  "Funded",
+  "Released",
+  "Refunded",
+]);
+
+/**
  * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
  * to "debug". These lines are noisy on the request hot path and can include
  * token addresses, so at the default "info" level, and in production, they stay
