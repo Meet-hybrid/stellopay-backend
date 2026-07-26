@@ -1,185 +1,129 @@
-# `src/auth/middleware.ts` — contract reference
+# Auth Middleware Contract
 
-This document is the executable counterpart to the TSDoc on
-`requireAuth` and `requireAdmin` in `src/auth/middleware.ts`. If the two
-ever disagree, the TSDoc wins for line-level details and this document wins
-for design intent and out-of-scope decisions.
+This document is the authoritative contract for `src/auth/middleware.ts`. It
+describes the principal-resolution boundary and the route-authorization
+boundary that every HTTP route in this codebase relies on. Read this before
+adding or moving a route that touches `req.auth`.
 
-## Purpose
+The implementation in `src/auth/middleware.ts` mirrors this contract line
+for line; if the two files ever disagree, this document is the source of
+truth and the implementation needs fixing.
 
-`src/auth/middleware.ts` is the only place in this service that turns raw
-HTTP request headers into a typed principal (`req.auth`). Every route that
-ever calls `req.auth.*` — `/auth/*`, `/events/process_batch`,
-`/events/process_tx/:tx_hash`, `/diagnostics/*`,
-`/admin/backfill-events/*`, `/admin/reprocess-events/*` and others —
-wires `requireAuth` directly; the admin-scoped routes additionally pipe
-through `requireAdmin`.
+## Why this exists
 
-The two exports are:
+`requireAuth` and `requireAdmin` are the only two authorized sources of
+`req.auth`. Centralizing them in a single module prevents privilege checks
+from drifting as new routers are added, and gives the test suite one place to
+exercise the boundary instead of N places.
 
-- `requireAuth(req, res, next)` — validates a session and attaches
-  `req.auth = { address, token }` on success.
-- `requireAdmin(req, res, next)` — checks the principal against the
-  `ADMIN_ADDRESSES` env allow-list.
+## Principal resolution — `requireAuth`
 
-## The single-principal invariant (and why this middleware does not paginate or batch)
+`requireAuth` resolves the principal from the request headers and binds it
+to `req.auth`.
 
-The hard contract on this file is **exactly one principal per HTTP request**:
+**Inputs (read verbatim):**
 
-- `req.auth` is a single object, never an array, never a cursor, never a
-  page.
-- `requireAuth` reads `x-user-address` and `Authorization` as
-  `string | string[] | undefined` per Express types, but — via
-  `readSingleHeader` — narrows them to a single non-empty trimmed `string`
-  or rejects with `401`. A multi-valued `x-user-address` (which would mean
-  "two principals in one request") is **rejected**, never partially accepted.
-- `requireAdmin` likewise operates on a single normalized address. There is
-  intentionally no `requireAdminForMany` variant.
+| Header           | Purpose                                                                         |
+| ---------------- | ------------------------------------------------------------------------------- |
+| `x-user-address` | The Starknet wallet address of the calling user.                                |
+| `authorization`  | `Bearer <token>`. The token is the session token issued by `POST /auth/verify`. |
 
-So while the rest of the codebase does paginate and batch — every list
-endpoint uses `parsePagination` from `src/utils/validation.ts` with
-`MAX_PAGE_LIMIT = 100` / `DEFAULT_PAGE_LIMIT = 50`, and the batch endpoints
-in `src/routes/transactions.ts`, `src/routes/events.ts`, and
-`src/routes/read.ts` cap batch sizes (e.g. `MAX_BATCH_SIZE = 50`) — those
-contracts live at the **route** layer, where one authenticated principal
-can drive batch operations across many on-chain entities. Batch resolution of
-principals themselves belongs to a different design conversation and is
-**out of scope** for this middleware.
+**Failure modes** — all respond `401 { error: "Unauthorized" }` and never
+call `next()`:
 
-Anything that would force us to break the single-principal invariant is,
-by definition, not a change to this file.
+- Either header is missing, `undefined`, or a non-string (Node's HTTP
+  parser can hand back multi-value headers as an array; calling
+  `.startsWith()` on those would throw, and the type guard catches it).
+- `authorization` does not start with `Bearer `.
+- The trimmed token or the trimmed address is empty.
+- `requireSession(address, token)` returns `false` or throws.
 
-## Input contract for `requireAuth`
+No failure path leaks the underlying reason, the session state, or the
+admin allowlist. The 401 body is identical across failure modes so the
+response cannot be used to probe header validity.
 
-Both headers are required, both must be a single non-empty trimmed string,
-and `Authorization` must be a Bearer token.
+**Success path** — sets `req.auth = { address, token }` and calls `next()`:
 
-| Header             | Required | Accepted shape                                      | On any other shape |
-| ------------------ | -------- | --------------------------------------------------- | ------------------ |
-| `x-user-address`   | yes      | single string, trimmed, non-empty                   | `401 Unauthorized` |
-| `Authorization`    | yes      | `Bearer <token>` — prefix is `Bearer ` (case-sensitive, single space); trailing whitespace is trimmed; token must be non-empty after trim | `401 Unauthorized` |
-| Other headers      | ignored  | —                                                   | —                  |
+- `req.auth.address` is the **lowercased header value, not the canonical
+  `0x + 64 hex` form**. `auth/session.ts` writes the same lowercased value
+  into the `sessions` table and does an exact 1:1 match on it. Adding
+  canonical padding at the boundary would silently desync principal vs.
+  session.
+- `req.auth.token` is the trimmed bearer token. Routes that need to revoke
+  the underlying session feed it to `revokeSession` from `auth/session.ts`,
+  which hashes it before the DB query.
+- `next()` is called **after** the try/catch — a throw in a downstream
+  route must be caught by Express and surfaced as a 5xx, never silently
+  relabeled as a 401.
 
-Edge cases that the middleware explicitly handles today, so the runtime
-path, tests, and docs agree:
+## Route authorization — `requireAdmin`
 
-- `x-user-address: ["0xa", "0xb"]` — multi-valued array → `401`. This is
-  the contract, not a bug. The middleware resolves one principal and will
-  not pick the first or join them.
-- `x-user-address: "   "` or `""` — empty / whitespace-only → `401`.
-- `Authorization: ["Bearer a", "Bearer b"]` — multi-valued → `401`.
-- `Authorization: "Basic abc"` — wrong scheme → `401`.
-- `Authorization: "bearer abc"` — case-sensitive `Bearer ` → `401`.
-- `Authorization: "Bearer "` or `Authorization: "Bearer    "` — empty
-  token after the prefix → `401`.
-- `x-user-address: "  0xUser  "` and `Authorization: "Bearer   abc   "`
-  are accepted: addresses are normalized to `0xuser`, tokens to `abc`.
+`requireAdmin` may only be used **after** `requireAuth`. It reads
+`req.auth.address` and the `ADMIN_ADDRESSES` env list (which
+`config.ts` lowercases at startup) and makes a yes-or-no decision.
 
-The trailing-trim after the prefix is intentional: real-world SDKs and curl
-pipelines occasionally double-space the credential. We accept that and
-normalize downstream.
+**Canonical comparison.** Both the principal address and every allowlist
+entry are passed through `normalizeStarknetAddress` (which pads to 64 hex
+characters, strips redundant leading zeros, verifies a mixed-case
+checksum, and rejects malformed values) before the comparison. As a result
+`0x1`, `0x000…001`, and a valid mixed-case checksum for the same address all
+resolve to one canonical string.
 
-## Output contract for `requireAuth`
+**Failure modes** — each with a distinct HTTP status:
 
-On success, `requireAuth` attaches:
+| Cause                                                    | Status | Body                        |
+| -------------------------------------------------------- | -----: | --------------------------- |
+| `req.auth` missing or `req.auth.address` is empty string |  `401` | `{ error: "Unauthorized" }` |
+| Principal present, but cannot be parsed as an address    |  `403` | `{ error: "Forbidden" }`    |
+| Parsed canonical ≠ every parsed allowlist entry          |  `403` | `{ error: "Forbidden" }`    |
+| Malformed entry in `ADMIN_ADDRESSES` is silently         |  `403` | `{ error: "Forbidden" }`    |
+| skipped (never matched, never crashed).                  |        |                             |
+| Principal matches the allowlist                          | (next) | (route handler response)    |
 
-```ts
-req.auth = { address: string /* trimmed + lower-cased */, token: string }
-```
+The `401`/`403` split is deliberate: callers must be able to tell "you are
+not signed in" apart from "you are signed in but not allowed". Collapsing
+them into a single 401 (the previous behaviour) made clients retry
+credentials forever on the second case.
 
-`req.auth.address` is the only form downstream code should compare against
-session rows or admin allow-lists. `requireSession` in
-`src/auth/session.ts` independently lower-cases for its DB lookup, so
-internal log lines and the row key line up with what `req.auth.address`
-holds.
+**Success path** — calls `next()` and lets the route handle the request.
 
-`requireAuth` does **not** mutate `req.headers`, does **not** set any other
-field on `req`, and does **not** read request bodies or query strings.
+## How callers consume `req.auth`
 
-## Failure contract
+`/auth/logout` reads `req.auth.token` and passes it to
+`revokeSession(token)`. `/auth/revoke` reads `req.auth.address` and passes
+it to `revokeAllSessionsForAddress(address)`. Both downstream functions
+do their own lowercase normalization, so the middleware's
+"raw lowercase header" choice is compatible without further massaging.
 
-Every failure path returns:
+Diagnostic, backfill, and reprocess-event routes layer
+`requireAuth, requireAdmin` per route. Order matters — `requireAdmin`
+asserts `req.auth` is present, so it MUST run after `requireAuth`.
 
-```http
-HTTP/1.1 401 Unauthorized
-Content-Type: application/json
+## Tests
 
-{ "error": "Unauthorized" }
-```
+`src/auth/middleware.test.ts` covers the full contract:
 
-The status code is `401` for **every** reason — not `403`, not `400`, not
-`502`. This is deliberate: it means a client probe cannot distinguish
-"unknown token" from "expired token" from "DB outage during session
-lookup" from "wrong address casing". The granular reason is emitted by
-`requireSession` into `session.rejected` log lines and the matching
-metric counters (`session_rejected_total`,
-`session_rejected_unknown_total`, etc.); those are operator-only signals.
+- `requireAuth` failure paths (missing header, non-string array header,
+  non-Bearer, empty trimmed token, empty trimmed address, invalid session,
+  throwing session lookup).
+- `requireAuth` success path (lowercased address stored, raw token
+  stored, next called).
+- `requireAdmin` 401 path (missing `req.auth`, empty address).
+- `requireAdmin` 403 path (non-admin authenticated, malformed
+  principal, allowlist has malformed entries).
+- `requireAdmin` success paths including canonical padding equivalence
+  between admin and principal.
 
-`requireAuth` further wraps `requireSession` in a `try/catch` so an
-unexpected throw (e.g. a `TypeError` from a future refactor) is also
-collapsed to `401`, not surfaced as `500`. This was the pre-existing
-behavior; the tests pin it down explicitly so it cannot regress.
+`src/routes/diagnostics.test.ts` exercises the boundary end-to-end with
+the real middlewares and a mocked session, so changing the
+401/403 contract will fail the route test too.
 
-## `requireAdmin` — ordering and defensive shape
+## Out of scope
 
-`requireAdmin` MUST be chained **after** `requireAuth`. The assumption is
-that `req.auth` is already populated and `req.auth.address` is the
-normalized (trimmed, lower-cased) form. Every existing wired chain in this
-repo (see `src/routes/diagnostics.ts`, `src/routes/backfill-events.ts`,
-`src/routes/reprocess-events.ts`) follows that ordering, and the tests on
-backfill/reprocess-events already mock `requireAuth` to set up `req.auth`
-before `requireAdmin` runs.
+The following are explicitly NOT part of this contract:
 
-Even if a future chain forgets the ordering, `requireAdmin` is hardened:
-
-- `req.auth` must be truthy with a non-empty string `address`. Otherwise
-  `401`.
-- `req.auth.address` is independently lower-cased at lookup, as
-  defense-in-depth, so a `req.auth` produced by hand without normalization
-  still matches `env.ADMIN_ADDRESSES`. The env itself is already trimmed,
-  lower-cased, and de-emptied by `src/config.ts`.
-
-Like `requireAuth`, all failure paths return `401 Unauthorized` with body
-`{ error: "Unauthorized" }` — never `403`. This avoids leaking whether
-the request was authenticated-but-not-admin.
-
-## Out of scope (intentional non-goals)
-
-- **Pagination/batching of principals.** Some other code paths in the
-  repo paginate or batch — every list endpoint uses `parsePagination`
-  (`src/utils/validation.ts`), and the batch endpoints
-  (`/events/process_batch`, `/reprocess-events/batch`,
-  `/indexed/payments/...`) cap batch sizes with `MAX_BATCH_SIZE = 50` —
-  but those are route-layer contracts that act **on** authenticated
-  resources, not contracts that distribute **authentication** across many
-  addresses at once. If a future route needs to enforce "this caller can
-  act on each of these N addresses", that is a dedicated authz layer, not
-  a change to this file.
-- **OAuth scopes / token introspection.** We accept only the raw bearer
-  token. No `scope`, no `Bearer realm="…"`, no JWT verification. If any of
-  that is ever required, it lives in a new middleware.
-- **Per-route rate-limit overrides on auth headers.** Rate limiting lives
-  in `src/middleware/rate-limit.ts`; this middleware is unaware of it.
-- **Rotating vs. raw tokens.** `requireSession` treats whatever is in
-  `Authorization` as a raw session token. Refresh tokens go through
-  `rotateSession` in `src/auth/session.ts`, not through this middleware.
-- **Logging the rejection reason.** The granularity is intentionally
-  surfaced in `requireSession`'s log/metric stream and not on the wire.
-  This file must not log addresses, tokens, or rejection reasons at
-  info/warn level.
-
-## Change management
-
-When changing anything in this file, the acceptance bar is:
-
-1. The runtime path, the tests in `src/auth/middleware.test.ts`, **and**
-   this document describe the same behavior. If you change one without
-   updating the other two, the change is incomplete.
-2. The single-principal invariant is preserved or, if intentionally
-   lifted, accompanied by an explicit design note in this file and a
-   follow-up issue.
-3. The wire envelope stays `{ error: "Unauthorized" }` / `401` for every
-   non-success path. Do not add `error_code`, `reason`, or any field that
-   would let a probe distinguish reasons.
-4. `pnpm test`, `pnpm lint`, and `pnpm build` all pass before opening a
-   PR.
+- Adding a third role beyond `admin`.
+- Theming the unauthorized response (e.g. Web3 wallet prompts).
+- Rate-limiting on the principal itself (see `middleware/rate-limit.ts`).
+- Session creation, which lives in `auth/session.ts`.
+- Token refresh/rotation, which lives in `routes/auth.ts`.

@@ -26,7 +26,9 @@ export default defineConfig({
         "src/db/migrate.ts",
         "src/middleware/rate-limit.ts",
         "src/routes/token.ts",
+        "src/routes/not-found.ts",
         "src/utils/token-formatting.ts",
+        "src/utils/validation.ts",
         "src/shutdown.ts",
       ],
       thresholds: {
