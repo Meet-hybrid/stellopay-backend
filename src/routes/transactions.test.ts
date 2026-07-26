@@ -246,3 +246,59 @@ describe("Transactions Router Logging", () => {
     expect(logSpy).not.toHaveBeenCalled();
   });
 });
+
+describe("Transaction Export Contracts", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should match the backward-compatible TransactionRecord shape on success", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=1"
+    );
+    expect(res.status).toBe(200);
+    const exportData = res.body;
+    
+    expect(exportData).toHaveProperty("total");
+    expect(exportData).toHaveProperty("hasMore");
+    expect(exportData).toHaveProperty("limit");
+    expect(exportData).toHaveProperty("offset");
+    expect(Array.isArray(exportData.transactions)).toBe(true);
+
+    if (exportData.transactions.length > 0) {
+      const record = exportData.transactions[0];
+      expect(record).toHaveProperty("id");
+      expect(typeof record.id).toBe("string");
+      expect(record).toHaveProperty("type");
+      expect(typeof record.type).toBe("string");
+      expect(record).toHaveProperty("address");
+      expect(typeof record.address).toBe("string");
+      expect(record).toHaveProperty("date");
+      expect(typeof record.date).toBe("string");
+      expect(record).toHaveProperty("time");
+      expect(typeof record.time).toBe("string");
+      expect(record).toHaveProperty("token");
+      expect(typeof record.token).toBe("string");
+      expect(record).toHaveProperty("amount");
+      expect(typeof record.amount).toBe("string");
+      expect(record).toHaveProperty("status", "Completed");
+      expect(record).toHaveProperty("tokenIcon");
+      expect(typeof record.tokenIcon).toBe("string");
+      expect(record).toHaveProperty("txHash");
+      expect(typeof record.txHash).toBe("string");
+      expect(record).toHaveProperty("createdAt");
+    }
+  });
+
+  it("should handle boundary/failure path gracefully when db throws", async () => {
+    const { db } = await import("../db/index.js");
+    vi.mocked(db.select).mockImplementationOnce(() => {
+      throw new Error("Database connection lost");
+    });
+    
+    const res = await request(app).get("/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4");
+    
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe("Database connection lost");
+  });
+});
