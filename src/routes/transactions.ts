@@ -590,4 +590,16 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       tokenFetchDurationMs, correlationId,
     });
 
-    res.json({ transactions: paginatedTransactions
+    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
+  } catch (e) {
+    const durationMs = Date.now() - startTime;
+    logTxMetrics({
+      route: req.path, userAddress: req.params?.user_address?.slice(0, 12) + "..." || "unknown",
+      durationMs, totalResults: 0, paymentsCount: 0, escrowCount: 0,
+      agreementEventsCount: 0, employeeCount: 0, milestoneCount: 0,
+      tokenFetchDurationMs, correlationId,
+      error: (e as Error).message,
+    });
+    next(e);
+  }
+});
