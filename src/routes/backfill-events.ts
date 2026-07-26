@@ -177,7 +177,7 @@ backfillEventsRouter.post(
       res.json(body);
     } catch (e: any) {
       if (e instanceof z.ZodError || e?.name === "ZodError") {
-        res.status(400).json({ error: e.errors?.[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
@@ -275,7 +275,7 @@ backfillEventsRouter.post(
       res.json(body);
     } catch (e: any) {
       if (e instanceof z.ZodError || e?.name === "ZodError") {
-        res.status(400).json({ error: e.errors?.[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
