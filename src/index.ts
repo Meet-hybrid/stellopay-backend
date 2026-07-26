@@ -22,7 +22,8 @@ import { backfillEventsRouter } from "./routes/backfill-events.js";
 import { contactRouter } from "./routes/contact.js";
 import { billingRouter } from "./routes/billing.js";
 import { apiV1NotFoundHandler } from "./routes/not-found.js";
-import { checkDbHealth, closePool } from "./db/index.js";
+import { checkDbHealth, closePool, waitForDbReadiness } from "./db/index.js";
+import { dbReadinessMiddleware, setApplicationReady } from "./middleware/db-readiness.js";
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
@@ -109,6 +110,8 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "1mb" }));
+
+app.use(dbReadinessMiddleware);
 
 // Rate limiting: limiters are built via the shared factory so the
 // keyGenerator (IP, honouring trust proxy) and JSON 429 envelope stay
@@ -208,4 +211,11 @@ if (process.env.NODE_ENV !== "test") {
 
   // Setup graceful shutdown handling
   setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
+
+  void (async () => {
+    await waitForDbReadiness();
+    setApplicationReady(true);
+    // eslint-disable-next-line no-console
+    console.log("[startup] Database ready — serving traffic");
+  })();
 }

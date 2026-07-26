@@ -108,6 +108,19 @@ export async function checkDbHealth(): Promise<boolean> {
   }
 }
 
+const DB_READINESS_POLL_MS = 500;
+
+/**
+ * Polls {@link checkDbHealth} until the database accepts a connection.
+ * Used during process startup before marking the app ready for API traffic.
+ */
+export async function waitForDbReadiness(): Promise<void> {
+  while (!(await checkDbHealth())) {
+    console.warn("[db] Waiting for database readiness...");
+    await new Promise((resolve) => setTimeout(resolve, DB_READINESS_POLL_MS));
+  }
+}
+
 /**
  * Closes the Postgres connection pool gracefully.
  */
