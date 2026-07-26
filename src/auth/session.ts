@@ -17,11 +17,26 @@ const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when `value` is a non-empty, non-whitespace-only string.
+ * Used to reject blank or whitespace-padded inputs before they reach DB queries.
+ */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 /**
  * Creates a new session in PostgreSQL for the given wallet address.
  * Generates a random 24-byte hex token, hashes it with SHA-256 for database storage,
  * and sets sliding and absolute expires timestamps.
+ *
+ * Throws a `TypeError` with message `"address must be a non-empty string"` when
+ * `address` is empty or whitespace-only, so callers fail fast with a clear signal
+ * instead of persisting a malformed row.
  *
  * Emits a `session.created` log line and bumps `session_created_total`.
  *
@@ -29,11 +44,22 @@ const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
  * @returns The raw token (to return to the client) and the token expiry time
  */
 export async function createSession(address: string) {
+  if (!isNonEmptyString(address)) {
+    logSessionEvent("error", "session.rejected", {
+      reason: "missing_input" as SessionRejectionReason,
+      operation: "create",
+      address: undefined,
+      message: "address must be a non-empty string",
+    });
+    incSessionMetric(SESSION_METRICS.REJECTED);
+    throw new TypeError("address must be a non-empty string");
+  }
+
   const token = crypto.randomBytes(24).toString("hex");
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const familyId = crypto.randomUUID();
   const now = Date.now();
-  const normalizedAddress = address.toLowerCase();
+  const normalizedAddress = address.trim().toLowerCase();
 
   try {
     await db.insert(sessionsTable).values({
@@ -50,6 +76,7 @@ export async function createSession(address: string) {
       address: normalizedAddress,
       message: errorMessage(error),
     });
+    incSessionMetric(SESSION_METRICS.REJECTED);
     throw error;
   }
 
@@ -76,11 +103,15 @@ export async function createSession(address: string) {
  * @returns A promise resolving to true if valid, false otherwise
  */
 export async function requireSession(address: string, token: string): Promise<boolean> {
-  if (!token || !address) {
-    recordRejection("missing_input", address);
+  if (!isNonEmptyString(token) || !isNonEmptyString(address)) {
+    recordRejection("missing_input", isNonEmptyString(address) ? address : undefined);
     return false;
   }
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+  const normalizedToken = token.trim();
+  const normalizedAddress = address.trim();
+
+  const tokenHash = crypto.createHash("sha256").update(normalizedToken).digest("hex");
   const now = new Date();
 
   try {
@@ -91,27 +122,27 @@ export async function requireSession(address: string, token: string): Promise<bo
       .limit(1);
 
     if (!session) {
-      recordRejection("unknown_token", address);
+      recordRejection("unknown_token", normalizedAddress);
       return false;
     }
     if (session.revokedAt !== null) {
-      recordRejection("revoked", address);
+      recordRejection("revoked", normalizedAddress);
       return false;
     }
     if (session.rotatedAt !== null) {
-      recordRejection("revoked", address);
+      recordRejection("revoked", normalizedAddress);
       return false;
     }
     if (session.expiresAt.getTime() < now.getTime()) {
-      recordRejection("expired_sliding", address);
+      recordRejection("expired_sliding", normalizedAddress);
       return false;
     }
     if (session.absoluteExpiresAt.getTime() < now.getTime()) {
-      recordRejection("expired_absolute", address);
+      recordRejection("expired_absolute", normalizedAddress);
       return false;
     }
-    if (session.address !== address.toLowerCase()) {
-      recordRejection("address_mismatch", address);
+    if (session.address !== normalizedAddress.toLowerCase()) {
+      recordRejection("address_mismatch", normalizedAddress);
       return false;
     }
 
@@ -131,7 +162,7 @@ export async function requireSession(address: string, token: string): Promise<bo
 
     incSessionMetric(SESSION_METRICS.VALIDATED);
     logSessionEvent("debug", "session.validated", {
-      address: address.toLowerCase(),
+      address: normalizedAddress.toLowerCase(),
       next_expires_at: new Date(nextExpiresAtMs).toISOString(),
     });
 
@@ -140,7 +171,7 @@ export async function requireSession(address: string, token: string): Promise<bo
     logSessionEvent("error", "session.rejected", {
       reason: "db_error" as SessionRejectionReason,
       operation: "require",
-      address: address.toLowerCase(),
+      address: normalizedAddress.toLowerCase(),
       message: errorMessage(error),
     });
     incSessionMetric(SESSION_METRICS.REJECTED);
@@ -158,9 +189,10 @@ export async function requireSession(address: string, token: string): Promise<bo
  * @param token - The raw session token to revoke
  */
 export async function revokeSession(token: string): Promise<void> {
-  if (!token) return;
+  if (!isNonEmptyString(token)) return;
+  const trimmedToken = token.trim();
   // Hash for the address correlation in the log — we never log the raw token.
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const tokenHash = crypto.createHash("sha256").update(trimmedToken).digest("hex");
   const tokenHashShort = tokenHash.slice(0, 8);
 
   await db
@@ -198,13 +230,13 @@ export type RotateResult =
  * @param token - The raw refresh token being presented
  */
 export async function rotateSession(address: string, token: string): Promise<RotateResult> {
-  if (!token || !address) {
-    recordRejection("missing_input", address);
+  if (!isNonEmptyString(token) || !isNonEmptyString(address)) {
+    recordRejection("missing_input", isNonEmptyString(address) ? address.trim() : undefined);
     return { ok: false, reason: "invalid" };
   }
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const tokenHash = crypto.createHash("sha256").update(token.trim()).digest("hex");
   const now = new Date();
-  const normalizedAddress = address.toLowerCase();
+  const normalizedAddress = address.trim().toLowerCase();
 
   const [session] = await db
     .select()
@@ -307,7 +339,18 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
-  const normalizedAddress = address.toLowerCase();
+  if (!isNonEmptyString(address)) {
+    // Guard: an empty/whitespace address would match every row with address='',
+    // and a truly blank string has no valid sessions to revoke anyway.
+    logSessionEvent("warn", "session.rejected", {
+      reason: "missing_input" as SessionRejectionReason,
+      operation: "revokeAll",
+      address: undefined,
+    });
+    incSessionMetric(SESSION_METRICS.REJECTED);
+    return;
+  }
+  const normalizedAddress = address.trim().toLowerCase();
   await db
     .update(sessionsTable)
     .set({ revokedAt: new Date() })
