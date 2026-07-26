@@ -26,6 +26,88 @@ export function redactRecentEvent(row: Record<string, unknown>): {
 }
 
 /**
+ * Fetches all telemetry and diagnostic data concurrently using Promise.all.
+ * Ensures read queries execute in parallel to minimize latency, eliminate sequential
+ * cascade bottlenecks, and guarantee side-effect-free replay safety.
+ */
+export async function fetchDiagnosticsData(dbClient = db) {
+  const [
+    eventTypeCountsResult,
+    escrowEventCountsResult,
+    paymentEventCountsResult,
+    tableCountsResult,
+    latestEventsResult,
+  ] = await Promise.all([
+    // Event type counts
+    dbClient.execute(sql`
+      SELECT event_type, COUNT(*) as count 
+      FROM agreement_events 
+      GROUP BY event_type 
+      ORDER BY count DESC
+    `),
+    // Escrow event counts
+    dbClient.execute(sql`
+      SELECT event_type, COUNT(*) as count 
+      FROM escrow_events 
+      GROUP BY event_type 
+      ORDER BY count DESC
+    `),
+    // Payment event counts
+    dbClient.execute(sql`
+      SELECT event_type, COUNT(*) as count 
+      FROM payments 
+      GROUP BY event_type 
+      ORDER BY count DESC
+    `),
+    // Table counts
+    dbClient.execute(sql`
+      SELECT 
+        (SELECT COUNT(*) FROM agreement_events) as agreement_events_count,
+        (SELECT COUNT(*) FROM escrow_events) as escrow_events_count,
+        (SELECT COUNT(*) FROM payments) as payments_count,
+        (SELECT COUNT(*) FROM employees) as employees_count,
+        (SELECT COUNT(*) FROM milestones) as milestones_count,
+        (SELECT COUNT(*) FROM agreements) as agreements_count,
+        (SELECT MAX(block_number) FROM agreement_events) as latest_block
+    `),
+    // Recent activity, redacted: event type and timestamp only. Transaction
+    // hashes and agreement ids are deliberately neither selected nor returned,
+    // since the aggregate counts already convey volume and the raw identifiers
+    // are a reconnaissance vector.
+    dbClient.execute(sql`
+      SELECT event_type, created_at
+      FROM agreement_events
+      ORDER BY created_at DESC
+      LIMIT 20
+    `),
+  ]);
+
+  const recentEvents = (
+    (latestEventsResult?.rows ?? []) as Array<Record<string, unknown>>
+  ).map(redactRecentEvent);
+
+  const summaryRow =
+    ((tableCountsResult?.rows ?? []) as Array<Record<string, unknown>>)?.[0] ?? {};
+
+  return {
+    eventTypeCounts: eventTypeCountsResult?.rows ?? [],
+    escrowEventCounts: escrowEventCountsResult?.rows ?? [],
+    paymentEventCounts: paymentEventCountsResult?.rows ?? [],
+    tableCounts: summaryRow,
+    latestEvents: recentEvents,
+    poolStats: getPoolStats(),
+    summary: {
+      totalAgreementEvents: summaryRow.agreement_events_count ?? 0,
+      totalEscrowEvents: summaryRow.escrow_events_count ?? 0,
+      totalPayments: summaryRow.payments_count ?? 0,
+      totalEmployees: summaryRow.employees_count ?? 0,
+      totalMilestones: summaryRow.milestones_count ?? 0,
+      latestBlock: summaryRow.latest_block ?? 0,
+    },
+  };
+}
+
+/**
  * GET /diagnostics/events (operator only)
  *
  * Returns aggregate event and table counts for operators. Raw row identifiers
@@ -39,74 +121,12 @@ diagnosticsRouter.get(
   requireAdmin,
   async (_req, res, next) => {
     try {
-      // Get event type counts
-      const eventTypeCounts = await db.execute(sql`
-        SELECT event_type, COUNT(*) as count 
-        FROM agreement_events 
-        GROUP BY event_type 
-        ORDER BY count DESC
-      `);
-
-      // Get escrow event counts
-      const escrowEventCounts = await db.execute(sql`
-        SELECT event_type, COUNT(*) as count 
-        FROM escrow_events 
-        GROUP BY event_type 
-        ORDER BY count DESC
-      `);
-
-      // Get payment event counts
-      const paymentEventCounts = await db.execute(sql`
-        SELECT event_type, COUNT(*) as count 
-        FROM payments 
-        GROUP BY event_type 
-        ORDER BY count DESC
-      `);
-
-      // Get table counts
-      const tableCounts = await db.execute(sql`
-        SELECT 
-          (SELECT COUNT(*) FROM agreement_events) as agreement_events_count,
-          (SELECT COUNT(*) FROM escrow_events) as escrow_events_count,
-          (SELECT COUNT(*) FROM payments) as payments_count,
-          (SELECT COUNT(*) FROM employees) as employees_count,
-          (SELECT COUNT(*) FROM milestones) as milestones_count,
-          (SELECT COUNT(*) FROM agreements) as agreements_count,
-          (SELECT MAX(block_number) FROM agreement_events) as latest_block
-      `);
-
-      // Recent activity, redacted: event type and timestamp only. Transaction
-      // hashes and agreement ids are deliberately neither selected nor returned,
-      // since the aggregate counts already convey volume and the raw identifiers
-      // are a reconnaissance vector.
-      const latestEvents = await db.execute(sql`
-        SELECT event_type, created_at
-        FROM agreement_events
-        ORDER BY created_at DESC
-        LIMIT 20
-      `);
-      const recentEvents = (latestEvents.rows as Array<Record<string, unknown>>).map(redactRecentEvent);
-      const summaryRow = (tableCounts.rows as Array<Record<string, unknown>>)?.[0] ?? {};
-
-      res.json({
-        eventTypeCounts: eventTypeCounts.rows,
-        escrowEventCounts: escrowEventCounts.rows,
-        paymentEventCounts: paymentEventCounts.rows,
-        tableCounts: summaryRow,
-        latestEvents: recentEvents,
-        poolStats: getPoolStats(),
-        summary: {
-          totalAgreementEvents: summaryRow.agreement_events_count ?? 0,
-          totalEscrowEvents: summaryRow.escrow_events_count ?? 0,
-          totalPayments: summaryRow.payments_count ?? 0,
-          totalEmployees: summaryRow.employees_count ?? 0,
-          totalMilestones: summaryRow.milestones_count ?? 0,
-          latestBlock: summaryRow.latest_block ?? 0,
-        },
-      });
+      const data = await fetchDiagnosticsData();
+      res.json(data);
     } catch (e) {
       next(e);
     }
   },
 );
+
 

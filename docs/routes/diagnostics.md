@@ -83,6 +83,14 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 
 ---
 
+## Reliability & Retry Semantics
+
+- **Concurrent Execution (`Promise.all`)**: Read queries for event types, escrow events, payment events, table totals, and recent activity are executed in parallel via `fetchDiagnosticsData`. This minimizes latency and prevents cascading roundtrip bottlenecks.
+- **Idempotency & Replay Safety**: All queries are side-effect-free static `SELECT` statements. Replaying requests or polling from monitoring scripts and incident reporting tools is 100% idempotent and safe.
+- **Null Safety**: Fallbacks (`[]` and `{}`) ensure that empty table states or partial query responses will not cause runtime `TypeError` exceptions.
+
+---
+
 ## Data Redaction & Reconnaissance Prevention
 
 Raw row identifiers and PII (such as transaction hashes, agreement IDs, contract addresses, and wallet addresses) are excluded from recent events responses. 

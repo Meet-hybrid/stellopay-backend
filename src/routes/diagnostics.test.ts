@@ -25,9 +25,10 @@ vi.mock("../db/index.js", () => ({
   schema: {},
 }));
 
-import { redactRecentEvent, diagnosticsRouter } from "./diagnostics.js";
+import { redactRecentEvent, fetchDiagnosticsData, diagnosticsRouter } from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
+
 
 const ADMIN = "0xadmin";
 const NON_ADMIN = "0xnotadmin";
@@ -100,6 +101,54 @@ describe("redactRecentEvent helper", () => {
     expect(redacted).not.toHaveProperty("employer");
   });
 });
+
+describe("fetchDiagnosticsData helper", () => {
+  it("executes read queries concurrently and returns structured telemetry", async () => {
+    const mockDb = {
+      execute: vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ event_type: "AgreementCreated", count: "10" }] })
+        .mockResolvedValueOnce({ rows: [{ event_type: "Funded", count: "4" }] })
+        .mockResolvedValueOnce({ rows: [{ event_type: "PaymentSent", count: "8" }] })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              agreement_events_count: "10",
+              escrow_events_count: "4",
+              payments_count: "8",
+              employees_count: "2",
+              milestones_count: "5",
+              agreements_count: "6",
+              latest_block: "500",
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              event_type: "AgreementCreated",
+              transaction_hash: "0xrawtx",
+              agreement_id: "ag-10",
+              created_at: "2026-07-26T18:10:00Z",
+            },
+          ],
+        }),
+    };
+
+    const data = await fetchDiagnosticsData(mockDb as any);
+
+    expect(mockDb.execute).toHaveBeenCalledTimes(5);
+    expect(data.eventTypeCounts).toEqual([{ event_type: "AgreementCreated", count: "10" }]);
+    expect(data.escrowEventCounts).toEqual([{ event_type: "Funded", count: "4" }]);
+    expect(data.paymentEventCounts).toEqual([{ event_type: "PaymentSent", count: "8" }]);
+    expect(data.summary.totalAgreementEvents).toBe("10");
+    expect(data.summary.latestBlock).toBe("500");
+    expect(data.latestEvents).toEqual([
+      { event_type: "AgreementCreated", created_at: "2026-07-26T18:10:00Z" },
+    ]);
+  });
+});
+
 
 describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
