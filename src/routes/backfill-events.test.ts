@@ -295,6 +295,32 @@ describe("Backfill Events Routes", () => {
 
       expect(res.body.error).toBeDefined();
     });
+
+    it("rejects an invalid `before` value (employee-events, 400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events?before=not-a-date")
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(mockDb.execute).not.toHaveBeenCalled();
+    });
+
+    it("rejects an invalid `before` value (milestone-events, 400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/backfill/milestone-events?before=not-a-date")
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(mockDb.execute).not.toHaveBeenCalled();
+    });
+
+    it("accepts a valid ISO `before` value and returns 200 (employee-events)", async () => {
+      const res = await request(app)
+        .post("/api/v1/backfill/employee-events?before=2024-06-01T00:00:00.000Z")
+        .expect(200);
+
+      expect(res.body.totalScanned).toBe(0);
+    });
   });
 
   describe("POST /backfill/employee-events", () => {
@@ -516,10 +542,77 @@ describe("Backfill Events Routes", () => {
       expect(res.body).toHaveProperty("totalScanned");
       expect(res.body).toHaveProperty("created");
       expect(res.body).toHaveProperty("results");
+      expect(res.body).toHaveProperty("nextCursor");
+      expect(res.body).toHaveProperty("hasMore");
       expect(typeof res.body.message).toBe("string");
       expect(typeof res.body.totalScanned).toBe("number");
       expect(typeof res.body.created).toBe("number");
       expect(Array.isArray(res.body.results)).toBe(true);
+      expect(typeof res.body.hasMore).toBe("boolean");
+    });
+
+    describe("Resume cursor (nextCursor / hasMore)", () => {
+      it("nextCursor is null when no rows are scanned", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/employee-events")
+          .expect(200);
+
+        expect(res.body.nextCursor).toBeNull();
+        expect(res.body.hasMore).toBe(false);
+      });
+
+      it("nextCursor equals the created_at of the last (oldest) scanned row", async () => {
+        const rows = [
+          { ...mockEmployeeRow, id: "emp_1", transaction_hash: "0xtx1", created_at: new Date("2024-01-05") },
+          { ...mockEmployeeRow, id: "emp_2", transaction_hash: "0xtx2", created_at: new Date("2024-01-03") },
+          { ...mockEmployeeRow, id: "emp_3", transaction_hash: "0xtx3", created_at: new Date("2024-01-01") },
+        ];
+        mockDb.execute.mockResolvedValue({ rows });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/employee-events?limit=100")
+          .expect(200);
+
+        expect(res.body.nextCursor).toBe(new Date("2024-01-01").toISOString());
+      });
+
+      it("hasMore is true when scanned rows equal the requested limit", async () => {
+        const rows = Array.from({ length: 5 }, (_, i) => ({
+          ...mockEmployeeRow,
+          id: `emp_${i}`,
+          transaction_hash: `0xtx${i}`,
+        }));
+        mockDb.execute.mockResolvedValue({ rows });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/employee-events?limit=5")
+          .expect(200);
+
+        expect(res.body.hasMore).toBe(true);
+      });
+
+      it("hasMore is false when fewer rows are returned than the requested limit", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/employee-events?limit=5")
+          .expect(200);
+
+        expect(res.body.hasMore).toBe(false);
+      });
+
+      it("accepts a valid ISO `before` value and passes results through unchanged", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/employee-events?before=2024-06-01T00:00:00.000Z")
+          .expect(200);
+
+        expect(res.body.created).toBe(1);
+        expect(res.body.nextCursor).toBe(new Date("2024-01-01").toISOString());
+      });
     });
   });
 
@@ -684,10 +777,75 @@ describe("Backfill Events Routes", () => {
       expect(res.body).toHaveProperty("totalScanned");
       expect(res.body).toHaveProperty("created");
       expect(res.body).toHaveProperty("results");
+      expect(res.body).toHaveProperty("nextCursor");
+      expect(res.body).toHaveProperty("hasMore");
       expect(typeof res.body.message).toBe("string");
       expect(typeof res.body.totalScanned).toBe("number");
       expect(typeof res.body.created).toBe("number");
       expect(Array.isArray(res.body.results)).toBe(true);
+      expect(typeof res.body.hasMore).toBe("boolean");
+    });
+
+    describe("Resume cursor (nextCursor / hasMore)", () => {
+      it("accepts a valid ISO `before` value and returns 200", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/milestone-events?before=2024-06-01T00:00:00.000Z")
+          .expect(200);
+
+        expect(res.body.created).toBe(1);
+      });
+
+      it("nextCursor is null when no rows are scanned", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/milestone-events")
+          .expect(200);
+
+        expect(res.body.nextCursor).toBeNull();
+        expect(res.body.hasMore).toBe(false);
+      });
+
+      it("nextCursor equals the created_at of the last (oldest) scanned row", async () => {
+        const rows = [
+          { ...mockMilestoneRow, id: "ms_1", transaction_hash: "0xtxa", created_at: new Date("2024-02-05") },
+          { ...mockMilestoneRow, id: "ms_2", transaction_hash: "0xtxb", created_at: new Date("2024-02-01") },
+        ];
+        mockDb.execute.mockResolvedValue({ rows });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/milestone-events?limit=100")
+          .expect(200);
+
+        expect(res.body.nextCursor).toBe(new Date("2024-02-01").toISOString());
+      });
+
+      it("hasMore is true when scanned rows equal the requested limit", async () => {
+        const rows = Array.from({ length: 3 }, (_, i) => ({
+          ...mockMilestoneRow,
+          id: `ms_${i}`,
+          transaction_hash: `0xtx${i}`,
+        }));
+        mockDb.execute.mockResolvedValue({ rows });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/milestone-events?limit=3")
+          .expect(200);
+
+        expect(res.body.hasMore).toBe(true);
+      });
+
+      it("hasMore is false when fewer rows are returned than the requested limit", async () => {
+        mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
+
+        const res = await request(app)
+          .post("/api/v1/backfill/milestone-events?limit=5")
+          .expect(200);
+
+        expect(res.body.hasMore).toBe(false);
+      });
     });
   });
 });

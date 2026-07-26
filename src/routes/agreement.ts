@@ -10,6 +10,7 @@ import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { TxHashSchema } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
 const AddressParam = StarknetAddress;
 const AgreementIdParam = z.coerce.bigint().positive();
@@ -982,7 +983,7 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
     try {
       const receipt = await provider.getTransactionReceipt(formattedTxHash);
       if (!receipt) {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -1008,7 +1009,7 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
       }
 
       if (!agreementId) {
-        res.status(404).json({ error: "AgreementCreated event not found in transaction" });
+        notFoundResponse(res, "AgreementCreated event not found in transaction");
         return;
       }
 
@@ -1050,10 +1051,11 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
     } catch (e: any) {
       // Handle transaction not found or not yet mined
       if (e?.message?.includes("Transaction hash not found") || e?.message?.includes("not found")) {
-        res.status(404).json({
-          error: "Transaction not found or not yet mined. Please wait a few moments and try again.",
-          details: e.message,
-        });
+        notFoundResponse(
+          res,
+          "Transaction not found or not yet mined. Please wait a few moments and try again.",
+          { details: e.message },
+        );
         return;
       }
       throw e; // Re-throw other errors
