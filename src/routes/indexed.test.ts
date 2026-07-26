@@ -6,17 +6,26 @@ import { defaults } from "../config.js";
 
 // Mock the db module (no real Postgres or config needed) and drizzle-orm
 // helpers. Each query resolves to the rows configured for its table, records
-// the limit/offset it was asked for, and returns [] for the innerJoin payroll
-// lookup so the dedup path stays simple.
-const { dbMock, schemaMock, state, limitSpy, offsetSpy } = vi.hoisted(() => {
+// the limit/offset it was asked for, and the innerJoin payroll lookup
+// (employee-agreements) resolves separately from `state.rows.employeeAgreements`,
+// shaped as `{ agreement }` rows to match the route's `.select({ agreement: ... })`.
+const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted(() => {
   const limitSpy = vi.fn();
   const offsetSpy = vi.fn();
   const state = { rows: {} as Record<string, any[]> };
+  // Records, in order, when each query is *issued* ("agreements"/"employeeAgreements")
+  // vs when it *resolves* ("resolved:agreements"/"resolved:employeeAgreements").
+  // Used to distinguish concurrent (Promise.all) from sequential (await, await)
+  // execution without relying on artificial delays/timers.
+  const callOrder: string[] = [];
 
   function from(tableName: string) {
     let joined = false;
     const chain: any = {
-      where: () => chain,
+      where: () => {
+        callOrder.push(joined ? "employeeAgreements" : tableName);
+        return chain;
+      },
       orderBy: () => chain,
       innerJoin: () => {
         joined = true;
@@ -30,8 +39,12 @@ const { dbMock, schemaMock, state, limitSpy, offsetSpy } = vi.hoisted(() => {
         offsetSpy(tableName, n);
         return chain;
       },
-      then: (resolve: (rows: any[]) => unknown) =>
-        resolve(joined ? [] : (state.rows[tableName] ?? [])),
+      then: (resolve: (rows: any[]) => unknown) => {
+        const label = joined ? "employeeAgreements" : tableName;
+        callOrder.push(`resolved:${label}`);
+        const rows = joined ? (state.rows.employeeAgreements ?? []) : (state.rows[tableName] ?? []);
+        return resolve(rows);
+      },
     };
     return chain;
   }
@@ -47,7 +60,7 @@ const { dbMock, schemaMock, state, limitSpy, offsetSpy } = vi.hoisted(() => {
         ),
     }
   );
-  return { dbMock: db, schemaMock: schema, state, limitSpy, offsetSpy };
+  return { dbMock: db, schemaMock: schema, state, limitSpy, offsetSpy, callOrder };
 });
 
 vi.mock("../db/index.js", () => ({ db: dbMock, schema: schemaMock }));
@@ -89,6 +102,7 @@ beforeEach(() => {
   limitSpy.mockClear();
   offsetSpy.mockClear();
   state.rows = {};
+  callOrder.length = 0;
 });
 
 describe("indexed routes validation", () => {
@@ -176,13 +190,47 @@ describe("indexed routes data paths", () => {
     expect(res.body.source).toBe("indexed");
   });
 
+  it("success path: runs the direct-agreements and employee-agreements queries concurrently, not sequentially", async () => {
+    state.rows.agreements = [{ id: "a1", contractAddress: "c" }];
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+    );
+    expect(res.status).toBe(200);
+
+    // Both queries must be *issued* before either *resolves*. A regression to
+    // sequential awaits would instead produce:
+    //   ["agreements", "resolved:agreements", "employeeAgreements", "resolved:employeeAgreements"]
+    expect(callOrder).toEqual([
+      "agreements",
+      "employeeAgreements",
+      "resolved:agreements",
+      "resolved:employeeAgreements",
+    ]);
+  });
+
+  it("boundary path: still combines results correctly when only the employee-agreements query returns rows", async () => {
+    // The direct-agreements query (employer/contributor) returns nothing, but
+    // the user is an employee on a payroll agreement — exercises the branch
+    // where the final result depends entirely on the second, concurrently-run
+    // query rather than the first.
+    state.rows.agreements = [];
+    state.rows.employeeAgreements = [{ agreement: { id: "payroll-1", contractAddress: "c" } }];
+
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.count).toBe(1);
+    expect(res.body.agreements).toEqual([{ id: "payroll-1", contractAddress: "c" }]);
+  });
+
   it("returns 404 when an agreement is not found", async () => {
     state.rows.agreements = [];
     const res = await request(makeApp()).get(
       `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/99`
     );
     expect(res.status).toBe(404);
-    expect(res.body.error).toBe("Agreement not found");
+    expect(res.body).toMatchObject({ success: false, error: "Agreement not found" });
   });
 
   it("returns aggregated detail when an agreement exists", async () => {

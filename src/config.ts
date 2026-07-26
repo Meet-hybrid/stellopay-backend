@@ -71,6 +71,15 @@ const EnvSchema = z.object({
     .default(5 * 60 * 1000),
   // Strict rate limit max requests per window - default 10
   RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().optional().default(10),
+  // Contact form rate limit window (milliseconds) - default 1 hour
+  RATE_LIMIT_CONTACT_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(60 * 60 * 1000),
+  // Contact form rate limit max requests per window - default 3
+  RATE_LIMIT_CONTACT_MAX: z.coerce.number().int().positive().optional().default(3),
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
 

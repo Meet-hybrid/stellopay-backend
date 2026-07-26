@@ -12,6 +12,27 @@ const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
 
+export interface TransactionRecord {
+  id: string;
+  type: string;
+  address: string;
+  date: string;
+  time: string;
+  token: string;
+  amount: string;
+  status: "Completed";
+  tokenIcon: string;
+  txHash: string;
+  createdAt: Date;
+}
+
+export interface TransactionExport {
+  transactions: TransactionRecord[];
+  total: number;
+  hasMore: boolean;
+  limit: number;
+  offset: number;
+}
 /**
  * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
  * to "debug". These lines are noisy on the request hot path and can include
@@ -548,7 +569,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       return eventTypeMap[eventType] || eventType;
     };
 
-    const allTransactions = [
+    const allTransactions: TransactionRecord[] = [
       ...uniqueAgreementEvents.map((a) => {
         const dateTime = formatDate(a.createdAt);
         return {
@@ -868,7 +889,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
       .limit(queryLimit);
 
-    const allTransactions = [
+    const allTransactions: TransactionRecord[] = [
       ...agreementEvents.map((a) => {
         const dateTime = formatDate(a.createdAt);
         return {
