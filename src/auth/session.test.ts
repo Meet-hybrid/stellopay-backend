@@ -46,6 +46,9 @@ const {
     row[col] !== null && row[col] !== undefined;
 
   const db = {
+    transaction: async (cb: (tx: any) => Promise<any>) => {
+      return cb(db);
+    },
     insert: (table: any) => ({
       values: async (data: any) => {
         mockState.sessions.push({
@@ -57,18 +60,31 @@ const {
         });
       },
     }),
-    select: () => ({
-      from: (table: any) => ({
-        where: (conditionFn: (row: any) => boolean) => ({
-          limit: (n: number) => {
-            const filtered = mockState.sessions.filter(conditionFn);
-            return {
-              then: (resolve: any) => resolve(filtered.slice(0, n)),
-            };
-          },
-        }),
-      }),
-    }),
+    select: () => {
+      const selectChain = {
+        from: (table: any) => selectChain,
+        where: (conditionFn: (row: any) => boolean) => {
+          selectChain._conditionFn = conditionFn;
+          return selectChain;
+        },
+        for: (mode: string) => selectChain,
+        limit: (n: number) => {
+          selectChain._limitVal = n;
+          return selectChain;
+        },
+        _conditionFn: (() => true) as (row: any) => boolean,
+        _limitVal: undefined as number | undefined,
+        then: (resolve: any) => {
+          const filtered = mockState.sessions.filter(selectChain._conditionFn);
+          const result =
+            selectChain._limitVal !== undefined
+              ? filtered.slice(0, selectChain._limitVal)
+              : filtered;
+          return resolve(result);
+        },
+      };
+      return selectChain;
+    },
     update: (table: any) => ({
       set: (updateData: any) => ({
         where: async (conditionFn: (row: any) => boolean) => {
@@ -517,6 +533,39 @@ describe("sessions", () => {
     const after = getSessionMetricsSnapshot().counters;
     expect(after[SESSION_METRICS.SWEEP_RUNS]).toBe(1);
     expect(after[SESSION_METRICS.SWEEP_DELETED]).toBe(1);
+  });
+
+  it("throttles database writes on sliding expiration updates", async () => {
+    const { token } = await createSession("0xThrottledAddress");
+    expect(mockState.sessions).toHaveLength(1);
+    const initialSession = { ...mockState.sessions[0] };
+    expect(initialSession.lastSeen).toBeNull();
+
+    // First requireSession validation: should write/update lastSeen
+    vi.advanceTimersByTime(10 * 1000); // 10 seconds in
+    const ok1 = await requireSession("0xThrottledAddress", token);
+    expect(ok1).toBe(true);
+
+    const firstUpdateSession = { ...mockState.sessions[0] };
+    expect(firstUpdateSession.lastSeen).not.toBeNull();
+    const firstLastSeenMs = firstUpdateSession.lastSeen.getTime();
+    expect(firstLastSeenMs).toBe(10 * 1000);
+
+    // Second requireSession validation (within 1 minute threshold, e.g. +20 seconds): should NOT write/update lastSeen
+    vi.advanceTimersByTime(20 * 1000); // 30 seconds total
+    const ok2 = await requireSession("0xThrottledAddress", token);
+    expect(ok2).toBe(true);
+
+    const secondUpdateSession = { ...mockState.sessions[0] };
+    expect(secondUpdateSession.lastSeen.getTime()).toBe(firstLastSeenMs); // remains 10 seconds
+
+    // Third requireSession validation (past 1 minute threshold, e.g. +65 seconds): should write/update lastSeen
+    vi.advanceTimersByTime(45 * 1000); // 75 seconds total (65 seconds since lastSeen)
+    const ok3 = await requireSession("0xThrottledAddress", token);
+    expect(ok3).toBe(true);
+
+    const thirdUpdateSession = { ...mockState.sessions[0] };
+    expect(thirdUpdateSession.lastSeen.getTime()).toBe(75 * 1000); // updated to 75 seconds
   });
 
   it("updates session_sweeper_last_deleted_count gauge after a sweep", async () => {

@@ -80,10 +80,19 @@ conventions in this file mirror that middleware: JSON output when
    └──────────────────────────────────────┘
 ```
 
----
+#### Sliding Expiration Write-Throttling
+To minimize database write load during frequent API requests, `requireSession` implements write-throttling. The session's `lastSeen` and `expiresAt` timestamps are only updated in the database if the time elapsed since `lastSeen` is at least 1 minute (`60,000 ms`). Validations occurring within this 1-minute window return successfully without invoking write operations to the database.
+
+### Token Rotation
 
 ## Structured log events
 
+#### Concurrency & Transaction Safety
+Token rotation is executed within a database transaction using row-level locking (`FOR UPDATE` on the matched session). This guarantees that concurrent rotation requests do not result in race conditions, ensuring that compromise detection and family revocation behave deterministically.
+
+#### Compromise Detection (Family Revocation)
+
+---
 Every event is a single line. Format depends on `LOG_FORMAT`:
 
 | `LOG_FORMAT`     | Output shape (per line)                                            |

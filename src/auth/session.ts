@@ -15,6 +15,8 @@ import { withBoundedRetry } from "./session-retry.js";
 
 const SESSION_TTL_MS = env.SESSION_TTL_MS;
 const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
+// Do not write to DB to update lastSeen/expiresAt if it was updated less than 1 minute ago.
+const SESSION_UPDATE_THRESHOLD_MS = 60 * 1000;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -122,13 +124,20 @@ export async function requireSession(address: string, token: string): Promise<bo
       nextExpiresAtMs = session.absoluteExpiresAt.getTime();
     }
 
-    await db
-      .update(sessionsTable)
-      .set({
-        lastSeen: now,
-        expiresAt: new Date(nextExpiresAtMs),
-      })
-      .where(eq(sessionsTable.tokenHash, tokenHash));
+    // Only update database if lastSeen is not set or threshold has elapsed to reduce repeated write I/O
+    const shouldUpdate =
+      !session.lastSeen ||
+      (now.getTime() - session.lastSeen.getTime() >= SESSION_UPDATE_THRESHOLD_MS);
+
+    if (shouldUpdate) {
+      await db
+        .update(sessionsTable)
+        .set({
+          lastSeen: now,
+          expiresAt: new Date(nextExpiresAtMs),
+        })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+    }
 
     incSessionMetric(SESSION_METRICS.VALIDATED);
     logSessionEvent("debug", "session.validated", {
@@ -272,75 +281,99 @@ export async function rotateSession(address: string, token: string): Promise<Rot
   const now = new Date();
   const normalizedAddress = address.toLowerCase();
 
-  const [session] = await db
-    .select()
-    .from(sessionsTable)
-    .where(eq(sessionsTable.tokenHash, tokenHash))
-    .limit(1);
+  try {
+    return await db.transaction(async (tx) => {
+      const [session] = await tx
+        .select()
+        .from(sessionsTable)
+        .where(eq(sessionsTable.tokenHash, tokenHash))
+        .for("update")
+        .limit(1);
 
-  if (!session || session.address !== normalizedAddress) {
-    recordRejection(session ? "address_mismatch" : "unknown_token", address);
-    return { ok: false, reason: "invalid" };
-  }
+      if (!session || session.address !== normalizedAddress) {
+        recordRejection(session ? "address_mismatch" : "unknown_token", address);
+        return { ok: false, reason: "invalid" };
+      }
 
-  // Fallback for rows created before this migration: treat the token itself
-  // as the root of its own family so future rotations still chain correctly.
-  const familyId = session.familyId ?? session.tokenHash;
+      // Fallback for rows created before this migration: treat the token itself
+      // as the root of its own family so future rotations still chain correctly.
+      const familyId = session.familyId ?? session.tokenHash;
 
-  if (session.rotatedAt !== null || session.revokedAt !== null) {
-    await revokeFamily(familyId);
-    incSessionMetric(SESSION_METRICS.REUSE_DETECTED);
-    logSessionEvent("warn", "session.reuse_detected", {
-      address: normalizedAddress,
-      family_id: familyId,
-      had_rotated_at: session.rotatedAt !== null,
-      had_revoked_at: session.revokedAt !== null,
+      if (session.rotatedAt !== null || session.revokedAt !== null) {
+        // Inline family revocation for transaction safety, replicating revokeFamily telemetry
+        await tx
+          .update(sessionsTable)
+          .set({ revokedAt: now })
+          .where(eq(sessionsTable.familyId, familyId));
+          
+        incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
+        logSessionEvent("warn", "session.family_revoked", {
+          family_id: familyId,
+        });
+
+        incSessionMetric(SESSION_METRICS.REUSE_DETECTED);
+        logSessionEvent("warn", "session.reuse_detected", {
+          address: normalizedAddress,
+          family_id: familyId,
+          had_rotated_at: session.rotatedAt !== null,
+          had_revoked_at: session.revokedAt !== null,
+        });
+        
+        return { ok: false, reason: "reused", familyId };
+      }
+
+      if (
+        session.expiresAt.getTime() < now.getTime() ||
+        session.absoluteExpiresAt.getTime() < now.getTime()
+      ) {
+        recordRejection(
+          session.absoluteExpiresAt.getTime() < now.getTime() ? "expired_absolute" : "expired_sliding",
+          address,
+        );
+        return { ok: false, reason: "invalid" };
+      }
+
+      const newToken = crypto.randomBytes(24).toString("hex");
+      const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
+      const nowMs = now.getTime();
+      let newExpiresAtMs = nowMs + SESSION_TTL_MS;
+      if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
+        newExpiresAtMs = session.absoluteExpiresAt.getTime();
+      }
+
+      // Issue the replacement before marking the old one rotated, so a failure
+      // here leaves the old token intact instead of orphaning the session.
+      await tx.insert(sessionsTable).values({
+        tokenHash: newTokenHash,
+        address: session.address,
+        familyId,
+        expiresAt: new Date(newExpiresAtMs),
+        absoluteExpiresAt: session.absoluteExpiresAt,
+      });
+
+      await tx
+        .update(sessionsTable)
+        .set({ rotatedAt: now })
+        .where(eq(sessionsTable.tokenHash, tokenHash));
+
+      incSessionMetric(SESSION_METRICS.ROTATED);
+      logSessionEvent("info", "session.rotated", {
+        address: normalizedAddress,
+        family_id: familyId,
+        expires_in_ms: newExpiresAtMs - nowMs,
+      });
+
+      return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
     });
-    return { ok: false, reason: "reused", familyId };
-  }
-
-  if (
-    session.expiresAt.getTime() < now.getTime() ||
-    session.absoluteExpiresAt.getTime() < now.getTime()
-  ) {
-    recordRejection(
-      session.absoluteExpiresAt.getTime() < now.getTime() ? "expired_absolute" : "expired_sliding",
-      address,
-    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REJECTED);
+    logSessionEvent("error", "session.rejected", {
+      reason: "db_error",
+      operation: "rotate",
+      error: error instanceof Error ? error.message : String(error),
+    });
     return { ok: false, reason: "invalid" };
   }
-
-  const newToken = crypto.randomBytes(24).toString("hex");
-  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
-  const nowMs = now.getTime();
-  let newExpiresAtMs = nowMs + SESSION_TTL_MS;
-  if (newExpiresAtMs > session.absoluteExpiresAt.getTime()) {
-    newExpiresAtMs = session.absoluteExpiresAt.getTime();
-  }
-
-  // Issue the replacement before marking the old one rotated, so a failure
-  // here leaves the old token intact instead of orphaning the session.
-  await db.insert(sessionsTable).values({
-    tokenHash: newTokenHash,
-    address: session.address,
-    familyId,
-    expiresAt: new Date(newExpiresAtMs),
-    absoluteExpiresAt: session.absoluteExpiresAt,
-  });
-
-  await db
-    .update(sessionsTable)
-    .set({ rotatedAt: now })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
-
-  incSessionMetric(SESSION_METRICS.ROTATED);
-  logSessionEvent("info", "session.rotated", {
-    address: normalizedAddress,
-    family_id: familyId,
-    expires_in_ms: newExpiresAtMs - nowMs,
-  });
-
-  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
 }
 
 /**
