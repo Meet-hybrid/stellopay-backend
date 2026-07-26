@@ -23,6 +23,7 @@ export const StarknetAddress = z
   )
   .transform((value) => normalizeStarknetAddress(value));
 
+
 /**
  * Shared Zod schema for a numeric agreement identifier passed as a string. The
  * id is stored as text, so it stays a string but must contain only digits,
