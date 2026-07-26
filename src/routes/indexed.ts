@@ -18,39 +18,43 @@ indexedRouter.get(
       const userAddress = StarknetAddress.parse(req.params.user_address);
       const { limit, offset } = parsePagination(req.query);
 
-      // Find agreements where user is employer or contributor
-      const agreements = await db
-        .select()
-        .from(schema.agreements)
-        .where(
-          and(
-            eq(schema.agreements.contractAddress, contractAddress),
-            or(
-              eq(schema.agreements.employer, userAddress),
-              eq(schema.agreements.contributor, userAddress),
+      // Find agreements where user is employer or contributor, and separately
+      // check if the user is an employee in any payroll agreements. These two
+      // queries don't depend on each other, so run them concurrently instead
+      // of paying for two sequential round trips.
+      const [agreements, employeeAgreements] = await Promise.all([
+        db
+          .select()
+          .from(schema.agreements)
+          .where(
+            and(
+              eq(schema.agreements.contractAddress, contractAddress),
+              or(
+                eq(schema.agreements.employer, userAddress),
+                eq(schema.agreements.contributor, userAddress),
+              ),
             ),
-          ),
-        )
-        .orderBy(desc(schema.agreements.createdAt))
-        .limit(limit)
-        .offset(offset);
+          )
+          .orderBy(desc(schema.agreements.createdAt))
+          .limit(limit)
+          .offset(offset),
 
-      // Also check if user is an employee in any payroll agreements
-      const employeeAgreements = await db
-        .select({
-          agreement: schema.agreements,
-        })
-        .from(schema.agreements)
-        .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
-        .where(
-          and(
-            eq(schema.agreements.contractAddress, contractAddress),
-            eq(schema.employees.employeeAddress, userAddress),
-            eq(schema.agreements.mode, 1), // Payroll mode
-          ),
-        )
-        .orderBy(desc(schema.agreements.createdAt))
-        .limit(limit);
+        db
+          .select({
+            agreement: schema.agreements,
+          })
+          .from(schema.agreements)
+          .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
+          .where(
+            and(
+              eq(schema.agreements.contractAddress, contractAddress),
+              eq(schema.employees.employeeAddress, userAddress),
+              eq(schema.agreements.mode, 1), // Payroll mode
+            ),
+          )
+          .orderBy(desc(schema.agreements.createdAt))
+          .limit(limit),
+      ]);
 
       // Combine and deduplicate
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
