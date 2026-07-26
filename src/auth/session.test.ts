@@ -14,6 +14,8 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock } =
       expiresAt: "expiresAt",
       absoluteExpiresAt: "absoluteExpiresAt",
       revokedAt: "revokedAt",
+      rotatedAt: "rotatedAt",
+      familyId: "familyId",
       lastSeen: "lastSeen",
     },
   };
@@ -31,6 +33,8 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock } =
         mockState.sessions.push({
           ...data,
           revokedAt: data.revokedAt || null,
+          rotatedAt: data.rotatedAt || null,
+          familyId: data.familyId || data.tokenHash,
           lastSeen: data.lastSeen || null,
         });
       },
@@ -100,7 +104,10 @@ import {
   requireSession,
   revokeSession,
   sweepExpiredSessions,
-} from "./session";
+  rotateSession,
+  revokeFamily,
+  revokeAllSessionsForAddress,
+} from "./session.js";
 
 describe("sessions", () => {
   beforeEach(() => {
@@ -199,5 +206,51 @@ describe("sessions", () => {
 
     const ok = await requireSession("0xabc", token);
     expect(ok).toBe(false);
+  });
+
+  it("rejects a rotated token in requireSession", async () => {
+    const { token } = await createSession("0xAddress");
+    await rotateSession("0xAddress", token);
+    expect(await requireSession("0xAddress", token)).toBe(false);
+  });
+
+  it("rotates a session token successfully", async () => {
+    const { token } = await createSession("0xAddress");
+    const result = await rotateSession("0xAddress", token);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.token).toBeDefined();
+      expect(await requireSession("0xAddress", result.token)).toBe(true);
+    }
+  });
+
+  it("revokes entire family if a rotated token is reused", async () => {
+    const { token } = await createSession("0xAddress");
+    const firstRotation = await rotateSession("0xAddress", token);
+    expect(firstRotation.ok).toBe(true);
+
+    // Reuse the original (now rotated) token
+    const reuseAttempt = await rotateSession("0xAddress", token);
+    expect(reuseAttempt.ok).toBe(false);
+    if (!reuseAttempt.ok && reuseAttempt.reason === "reused") {
+      expect(reuseAttempt.familyId).toBeDefined();
+    }
+
+    // The new token from the first rotation should now be revoked (entire family revoked)
+    if (firstRotation.ok) {
+      expect(await requireSession("0xAddress", firstRotation.token)).toBe(false);
+    }
+  });
+
+  it("revokes all sessions for a specific address", async () => {
+    const s1 = await createSession("0xTarget");
+    const s2 = await createSession("0xTarget");
+    const s3 = await createSession("0xOther");
+
+    await revokeAllSessionsForAddress("0xTarget");
+
+    expect(await requireSession("0xTarget", s1.token)).toBe(false);
+    expect(await requireSession("0xTarget", s2.token)).toBe(false);
+    expect(await requireSession("0xOther", s3.token)).toBe(true);
   });
 });

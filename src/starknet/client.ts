@@ -31,7 +31,6 @@ async function invokeWithFailover(
       }
       const result = await fn.apply(candidate, args);
       if (index !== healthyRpcIndex) {
-        // eslint-disable-next-line no-console
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
         );

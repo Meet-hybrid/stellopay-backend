@@ -57,6 +57,7 @@ export async function requireSession(address: string, token: string): Promise<bo
 
     if (!session) return false;
     if (session.revokedAt !== null) return false;
+    if (session.rotatedAt !== null) return false;
     if (session.expiresAt.getTime() < now.getTime()) return false;
     if (session.absoluteExpiresAt.getTime() < now.getTime()) return false;
     if (session.address !== address.toLowerCase()) return false;
