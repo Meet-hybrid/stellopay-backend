@@ -25,7 +25,6 @@ async function callContractResult(
 }
 
 // -------- contracts / schemas --------
-// Explicit compatibility story for cursor-based reads and batching
 
 export const CursorPaginationSchema = z.object({
   cursor: z.string().optional(),

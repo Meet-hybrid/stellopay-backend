@@ -1,10 +1,10 @@
 # Read Route Documentation
 
-This document explicitly defines the backwards-compatible behavior for cursor-based reads, record ordering, and batching in `src/routes/read.ts`. Future changes must preserve these exact contracts to ensure safe maintenance for existing consumers.
+This document defines the strict contracts for pagination and batching across `src/routes/read.ts` and its consumers.
 
 ## Cursor-Based Pagination
 
-When an endpoint supports cursor-based pagination, it MUST use `CursorPaginationSchema` to validate the incoming query parameters.
+When an endpoint supports cursor-based pagination to read streams of events or records, it MUST use `CursorPaginationSchema` to validate the incoming query parameters. 
 
 ```typescript
 export const CursorPaginationSchema = z.object({
@@ -12,30 +12,28 @@ export const CursorPaginationSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 ```
+- **limit**: Caps results per page. Minimum 1, Maximum 100, Default 50.
+- **cursor**: A string representing the starting position for the next page. 
 
-- **limit**: Maximum number of records to return. Minimum is 1, maximum is 100, and defaults to 50 if omitted.
-- **cursor**: A string token indicating the position for the next page of results. Omit for the first page.
-
-The corresponding response MUST adhere to the generic `PaginatedReadResponse<T>` shape:
+The successful response MUST match the generic `PaginatedReadResponse<T>` shape:
 
 ```typescript
 export interface PaginatedReadResponse<T> {
-  data: T[]; // Array containing the paginated records
-  nextCursor: string | null; // The opaque string to pass as `cursor` for the next page, or null if end of stream
-  hasMore: boolean; // Indicates if further pages exist
-  limit: number; // The limit applied to this request
+  data: T[]; // The actual array of records
+  nextCursor: string | null; // The cursor to use for the next page, or null if there are no more pages
+  hasMore: boolean; // True if there are more records remaining
+  limit: number; // The limit that was applied to the query
 }
 ```
 
-## Batch Operations
+## Batching
 
-Endpoints fetching discrete resources by an explicit list of identifiers MUST validate the request via `BatchReadSchema` to guard against runaway backend scans.
+When reading multiple discrete items by their ID (e.g. fetching summaries for multiple agreements), endpoints MUST use `BatchReadSchema` to prevent oversized queries or resource exhaustion.
 
 ```typescript
 export const BatchReadSchema = z.object({
   ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
 });
 ```
-
-- **ids**: A non-empty array of positive `BigInt` equivalents (often transmitted as strings).
-- **Hard Bounds**: A minimum of 1 and a strict maximum of 50 IDs per request. Re-batch larger datasets on the client.
+- **ids**: A non-empty array of positive bigints.
+- **Max Batch Size**: Hardcoded to 50 items per request to keep RPC calls and database lookups constrained.

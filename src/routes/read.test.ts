@@ -96,6 +96,7 @@ describe("read routes", () => {
 
   describe("Pagination and Batching Schemas", () => {
     it("CursorPaginationSchema should apply defaults and limits", () => {
+      const { CursorPaginationSchema } = require("./read.js");
       const defaultRes = CursorPaginationSchema.parse({});
       expect(defaultRes.limit).toBe(50);
       expect(defaultRes.cursor).toBeUndefined();
@@ -110,6 +111,7 @@ describe("read routes", () => {
     });
 
     it("BatchReadSchema should enforce array limits and valid items", () => {
+      const { BatchReadSchema } = require("./read.js");
       const valid = BatchReadSchema.parse({ ids: ["1", "2"] });
       expect(valid.ids.length).toBe(2);
 
