@@ -98,6 +98,10 @@ export async function requireSession(address: string, token: string): Promise<bo
       recordRejection("revoked", address);
       return false;
     }
+    if (session.rotatedAt !== null) {
+      recordRejection("revoked", address);
+      return false;
+    }
     if (session.expiresAt.getTime() < now.getTime()) {
       recordRejection("expired_sliding", address);
       return false;
