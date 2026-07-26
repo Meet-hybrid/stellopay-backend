@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
+import { defaults } from "../config.js";
 
 // Mock the db module (no real Postgres or config needed) and drizzle-orm
 // helpers. Each query resolves to the rows configured for its table, records
@@ -102,7 +103,7 @@ describe("indexed routes validation", () => {
 
   it("rejects a non-numeric agreement_id with 400", async () => {
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreement/${VALID}/12ab`
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/12ab`
     );
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("Validation failed");
@@ -113,6 +114,30 @@ describe("indexed routes validation", () => {
       `/api/v1/indexed/escrow/not-hex-zzz/balance/7`
     );
     expect(res.status).toBe(400);
+  });
+
+  it("rejects a mismatching contract address for agreements list with 400", async () => {
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${defaults.payrollEscrowAddress}/user/${VALID}`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid contract address for agreements");
+  });
+
+  it("rejects a mismatching contract address for agreement details with 400", async () => {
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/agreement/${defaults.payrollEscrowAddress}/7`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid contract address for agreement details");
+  });
+
+  it("rejects a mismatching contract address for escrow balance with 400", async () => {
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/escrow/${defaults.workAgreementAddress}/balance/7`
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid contract address for escrow balance");
   });
 });
 
@@ -128,7 +153,7 @@ describe("indexed routes pagination clamping", () => {
 
   it("applies a valid limit and offset on the agreements list", async () => {
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}?limit=10&offset=20`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}?limit=10&offset=20`
     );
     expect(res.status).toBe(200);
     expect(limitSpy).toHaveBeenCalledWith("agreements", 10);
@@ -144,7 +169,7 @@ describe("indexed routes data paths", () => {
       { id: "a2", contractAddress: "c" },
     ];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
     expect(res.body.count).toBe(2);
@@ -154,7 +179,7 @@ describe("indexed routes data paths", () => {
   it("returns 404 when an agreement is not found", async () => {
     state.rows.agreements = [];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreement/${VALID}/99`
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/99`
     );
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("Agreement not found");
@@ -168,7 +193,7 @@ describe("indexed routes data paths", () => {
     state.rows.employees = [{ id: "emp1" }];
     state.rows.escrowEvents = [{ id: "x1" }];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreement/${VALID}/7`
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
     );
     expect(res.status).toBe(200);
     expect(res.body.agreement.id).toBe("7");
@@ -184,7 +209,7 @@ describe("indexed routes data paths", () => {
       { eventType: "Other", amount: "9" },
     ];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/escrow/${VALID}/balance/7`
+      `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
     );
     expect(res.status).toBe(200);
     expect(res.body.balance).toBe("500");

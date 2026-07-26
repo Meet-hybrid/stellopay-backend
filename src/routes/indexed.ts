@@ -6,6 +6,8 @@ import {
   AgreementId,
   parsePagination,
 } from "../utils/validation.js";
+import { defaults } from "../config.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 
 export const indexedRouter = Router();
 
@@ -15,6 +17,10 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+        res.status(400).json({ error: "Invalid contract address for agreements" });
+        return;
+      }
       const userAddress = StarknetAddress.parse(req.params.user_address);
       const { limit, offset } = parsePagination(req.query);
 
@@ -75,6 +81,10 @@ indexedRouter.get(
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
+    if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+      res.status(400).json({ error: "Invalid contract address for agreement details" });
+      return;
+    }
     const agreementId = AgreementId.parse(req.params.agreement_id);
 
     const agreement = await db
@@ -170,6 +180,10 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      if (contractAddress !== normalizeAddr(defaults.payrollEscrowAddress)) {
+        res.status(400).json({ error: "Invalid contract address for escrow balance" });
+        return;
+      }
       const agreementId = AgreementId.parse(req.params.agreement_id);
 
       // Calculate balance from escrow events
