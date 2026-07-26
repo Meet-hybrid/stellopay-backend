@@ -1,4 +1,4 @@
-﻿import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   StarknetAddress,
   AgreementId,
@@ -74,5 +74,26 @@ describe("parsePagination", () => {
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
     });
+  });
+});
+
+// -- loggedParse ------------------------------------------------------------
+
+describe("loggedParse", () => {
+  it("returns the parsed value on success", () => {
+    const schema = z.string().min(1);
+    const result = loggedParse(schema, "hello", "testSchema");
+    expect(result).toBe("hello");
+  });
+
+  it("logs and throws on validation failure", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    expect(() => loggedParse(schema, "", "testSchema")).toThrow();
+    expect(warn).toHaveBeenCalledOnce();
+    const call = warn.mock.calls[0][0] as string;
+    expect(call).toContain("[validation:error]");
+    expect(call).toContain("testSchema");
+    warn.mockRestore();
   });
 });
