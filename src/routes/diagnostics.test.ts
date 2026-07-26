@@ -102,6 +102,36 @@ describe("redactRecentEvent helper", () => {
     expect(redacted).not.toHaveProperty("agreement_id");
     expect(redacted).not.toHaveProperty("employer");
   });
+
+  it("provides safe fallbacks for malformed inputs without crashing", () => {
+    // Missing fields
+    expect(redactRecentEvent({})).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Invalid types
+    expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Null or undefined
+    expect(redactRecentEvent(null)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+    expect(redactRecentEvent(undefined)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Primitive values
+    expect(redactRecentEvent("just a string")).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+  });
 });
 
 describe("fetchDiagnosticsData helper", () => {

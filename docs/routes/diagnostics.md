@@ -95,7 +95,7 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 
 Raw row identifiers and PII (such as transaction hashes, agreement IDs, contract addresses, and wallet addresses) are excluded from recent events responses. 
 
-Row outputs are passed through the `redactRecentEvent` helper to guarantee that only non-sensitive attributes (`event_type` and `created_at`) are returned.
+Row outputs are passed through the `redactRecentEvent` helper to guarantee that only non-sensitive attributes (`event_type` and `created_at`) are returned. Malformed rows missing these fields or providing invalid types gracefully fall back to `"Unknown"` and a zero-epoch timestamp, ensuring safe evaluation by downstream code.
 
 ---
 
