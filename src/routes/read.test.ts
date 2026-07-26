@@ -93,4 +93,32 @@ describe("read routes", () => {
       });
     });
   });
+
+  describe("Pagination and Batching Schemas", () => {
+    it("CursorPaginationSchema should apply defaults and limits", () => {
+      const { CursorPaginationSchema } = require("./read.js");
+      const defaultRes = CursorPaginationSchema.parse({});
+      expect(defaultRes.limit).toBe(50);
+      expect(defaultRes.cursor).toBeUndefined();
+
+      const customRes = CursorPaginationSchema.parse({ cursor: "abc", limit: 10 });
+      expect(customRes.limit).toBe(10);
+      expect(customRes.cursor).toBe("abc");
+
+      // Boundary tests
+      expect(() => CursorPaginationSchema.parse({ limit: 0 })).toThrow();
+      expect(() => CursorPaginationSchema.parse({ limit: 101 })).toThrow();
+    });
+
+    it("BatchReadSchema should enforce array limits and valid items", () => {
+      const { BatchReadSchema } = require("./read.js");
+      const valid = BatchReadSchema.parse({ ids: ["1", "2"] });
+      expect(valid.ids.length).toBe(2);
+
+      // Boundary tests
+      expect(() => BatchReadSchema.parse({ ids: [] })).toThrow();
+      const largeArray = Array.from({ length: 51 }, (_, i) => BigInt(i + 1));
+      expect(() => BatchReadSchema.parse({ ids: largeArray })).toThrow();
+    });
+  });
 });
