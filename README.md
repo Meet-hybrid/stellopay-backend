@@ -42,7 +42,7 @@ All configuration is parsed and validated in `src/config.ts`. `env.example` has 
 
 | Variable                                                       | Default                                         | Notes                                                                   |
 | -------------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------- |
-| `STARKNET_RPC_URL`                                             | (required)                                      | Startup fails if unset                                                  |
+| `STARKNET_RPC_URL`                                             | (required)                                      | Comma-separated HTTPS JSON-RPC URLs; failover tries each in order on RPC errors |
 | `NODE_ENV`                                                     | `development`                                   | `production` enforces the ABI path guard below                          |
 | `PORT`                                                         | `4000`                                          |                                                                         |
 | `CORS_ORIGIN`                                                  | `*`                                             | See the CORS Configuration section                                      |

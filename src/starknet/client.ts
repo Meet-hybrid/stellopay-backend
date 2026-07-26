@@ -1,8 +1,67 @@
 import { Contract, RpcProvider } from "starknet";
-import { env, abiPaths } from "../config.js";
+import { abiPaths, starknetRpcUrls } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "./abi.js";
 
-export const provider = new RpcProvider({ nodeUrl: env.STARKNET_RPC_URL });
+const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
+
+/** Index into rpcProviders for the last known healthy endpoint. */
+let healthyRpcIndex = 0;
+
+function rpcFailoverOrder(): number[] {
+  const order = [healthyRpcIndex];
+  for (let i = 0; i < rpcProviders.length; i++) {
+    if (i !== healthyRpcIndex) {
+      order.push(i);
+    }
+  }
+  return order;
+}
+
+async function invokeWithFailover(
+  method: string | symbol,
+  args: unknown[],
+): Promise<unknown> {
+  let lastError: unknown;
+  for (const index of rpcFailoverOrder()) {
+    const candidate = rpcProviders[index]!;
+    try {
+      const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
+      if (typeof fn !== "function") {
+        throw new TypeError(`RpcProvider.${String(method)} is not a function`);
+      }
+      const result = await fn.apply(candidate, args);
+      if (index !== healthyRpcIndex) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
+        );
+        healthyRpcIndex = index;
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Starknet RPC client with automatic failover across configured endpoints.
+ * Subsequent calls reuse the last healthy endpoint until it fails again.
+ */
+export const provider = new Proxy(rpcProviders[0]!, {
+  get(_target, prop, _receiver) {
+    if (prop === "then") {
+      return undefined;
+    }
+    const active = rpcProviders[healthyRpcIndex]!;
+    const value = Reflect.get(active, prop, active);
+    if (typeof value === "function") {
+      return (...args: unknown[]) => invokeWithFailover(prop, args);
+    }
+    return value;
+  },
+}) as RpcProvider;
 
 // The contract-class JSON paths are fixed at startup, so each ABI is parsed
 // from disk once and the result is memoized for every later call.
@@ -126,4 +185,11 @@ export function clearNetworkCache(): void {
   cachedChainId = undefined;
   cachedSpecVersion = undefined;
   cacheExpiryTime = 0;
+}
+
+/**
+ * Resets RPC failover state to the primary endpoint. For tests only.
+ */
+export function resetRpcFailoverForTests(): void {
+  healthyRpcIndex = 0;
 }

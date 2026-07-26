@@ -1,5 +1,34 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
+
+const mockRpcProviders = vi.hoisted(() =>
+  [] as Array<{
+    nodeUrl: string;
+    getChainId: ReturnType<typeof vi.fn>;
+    getSpecVersion: ReturnType<typeof vi.fn>;
+  }>,
+);
+
+vi.mock("starknet", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("starknet")>();
+  class MockRpcProvider {
+    nodeUrl: string;
+    getChainId: ReturnType<typeof vi.fn>;
+    getSpecVersion: ReturnType<typeof vi.fn>;
+
+    constructor({ nodeUrl }: { nodeUrl: string }) {
+      this.nodeUrl = nodeUrl;
+      this.getChainId = vi.fn();
+      this.getSpecVersion = vi.fn().mockResolvedValue("0.6.0");
+      mockRpcProviders.push(this);
+    }
+  }
+  return {
+    ...actual,
+    RpcProvider: MockRpcProvider as unknown as typeof actual.RpcProvider,
+  };
+});
+
 import {
   provider,
   getCachedNetworkInfo,
@@ -7,21 +36,24 @@ import {
   escrowContract,
   agreementContract,
   clearContractCache,
+  resetRpcFailoverForTests,
 } from "./client.js";
 
+const VITEST_POSTGRES =
+  process.env.POSTGRES_CONNECTION_STRING ??
+  "postgresql://postgres:postgres@localhost:5432/stellopay_indexer";
+
 describe("Starknet Client Cache", () => {
-  let getChainIdSpy: any;
-  let getSpecVersionSpy: any;
+  let getChainIdSpy: ReturnType<typeof vi.fn>;
+  let getSpecVersionSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    // Clear cache before each test
+    resetRpcFailoverForTests();
     clearNetworkCache();
 
-    // Mock the provider methods
-    getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e"); // SN_MAIN
+    getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
     getSpecVersionSpy = vi.spyOn(provider, "getSpecVersion").mockResolvedValue("0.6.0");
 
-    // Mock Date.now to control time
     vi.useFakeTimers();
   });
 
@@ -44,43 +76,37 @@ describe("Starknet Client Cache", () => {
     const info2 = await getCachedNetworkInfo();
 
     expect(info2.chainId).toBe("0x534e5f4d41494e");
-    expect(getChainIdSpy).toHaveBeenCalledTimes(1); // Still 1, not 2
+    expect(getChainIdSpy).toHaveBeenCalledTimes(1);
     expect(getSpecVersionSpy).toHaveBeenCalledTimes(1);
   });
 
   it("should fetch from RPC again after TTL expires", async () => {
-    const TTL = 300000; // 5 mins
+    const TTL = 300000;
     await getCachedNetworkInfo(TTL);
 
-    // Advance time past TTL
     vi.advanceTimersByTime(TTL + 1000);
 
     const info2 = await getCachedNetworkInfo(TTL);
 
     expect(info2.chainId).toBe("0x534e5f4d41494e");
-    expect(getChainIdSpy).toHaveBeenCalledTimes(2); // Called again
+    expect(getChainIdSpy).toHaveBeenCalledTimes(2);
     expect(getSpecVersionSpy).toHaveBeenCalledTimes(2);
   });
 
   it("should not poison cache on RPC failure", async () => {
-    // Make RPC fail
     getChainIdSpy.mockRejectedValueOnce(new Error("RPC Error"));
 
     await expect(getCachedNetworkInfo()).rejects.toThrow("RPC Error");
 
-    // Fix RPC
     getChainIdSpy.mockResolvedValueOnce("0x534e5f4d41494e");
 
-    // Second call should succeed because cache was not set
     const info = await getCachedNetworkInfo();
     expect(info.chainId).toBe("0x534e5f4d41494e");
-    expect(getChainIdSpy).toHaveBeenCalledTimes(2); // 1 failed, 1 succeeded
+    expect(getChainIdSpy).toHaveBeenCalledTimes(2);
   });
 });
 
 describe("ABI memoization and contract caching", () => {
-  // Both are valid Starknet felts (the configured contract defaults), used here
-  // only as two distinct addresses for the cache.
   const ADDR_A = "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4";
   const ADDR_B = "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd";
 
@@ -88,7 +114,6 @@ describe("ABI memoization and contract caching", () => {
 
   beforeEach(() => {
     clearContractCache();
-    // Spy without stubbing: real fixture reads still happen, we only count them.
     readSpy = vi.spyOn(fs, "readFileSync");
   });
 
@@ -96,7 +121,6 @@ describe("ABI memoization and contract caching", () => {
     vi.restoreAllMocks();
   });
 
-  /** Counts how many times a given contract-class file was read from disk. */
   function diskReads(fragment: string): number {
     return readSpy.mock.calls.filter((c) => String(c[0]).includes(fragment)).length;
   }
@@ -122,7 +146,6 @@ describe("ABI memoization and contract caching", () => {
     const b = escrowContract(ADDR_B);
 
     expect(b).not.toBe(a);
-    // The ABI is memoized, so a second address does not trigger another read.
     expect(diskReads("PayrollEscrow.contract_class.json")).toBe(1);
   });
 
@@ -139,5 +162,92 @@ describe("ABI memoization and contract caching", () => {
 
     expect(after).not.toBe(before);
     expect(diskReads("PayrollEscrow.contract_class.json")).toBe(2);
+  });
+});
+
+describe("RPC endpoint failover", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function loadClientWithRpcUrls(rpcEnv: string) {
+    vi.resetModules();
+    mockRpcProviders.length = 0;
+    process.env.STARKNET_RPC_URL = rpcEnv;
+    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+    return import("./client.js");
+  }
+
+  it("uses a single configured endpoint when only one URL is set", async () => {
+    const client = await loadClientWithRpcUrls("https://only.example/rpc");
+    client.resetRpcFailoverForTests();
+
+    const primary = mockRpcProviders[0]!;
+    primary.getChainId.mockResolvedValue("0x1");
+    primary.getSpecVersion.mockResolvedValue("0.6.0");
+
+    await client.getCachedNetworkInfo();
+    await client.getCachedNetworkInfo();
+
+    expect(mockRpcProviders).toHaveLength(1);
+    expect(primary.getChainId).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the next URL when the primary RPC call fails", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.clearNetworkCache();
+
+    const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockRejectedValue(new Error("primary down"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("primary down"));
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
+
+    const info = await client.getCachedNetworkInfo();
+    expect(info.chainId).toBe("0x534e5f4d41494e");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("https://primary.example/rpc"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("https://secondary.example/rpc"),
+    );
+  });
+
+  it("reuses the healthy endpoint on later calls without retrying the dead primary", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.clearNetworkCache();
+
+    const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockRejectedValue(new Error("primary down"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("primary down"));
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
+
+    await client.getCachedNetworkInfo();
+    client.clearNetworkCache();
+    primary!.getChainId.mockClear();
+    primary!.getSpecVersion.mockClear();
+    secondary!.getChainId.mockClear();
+    secondary!.getSpecVersion.mockClear();
+
+    await client.getCachedNetworkInfo();
+
+    expect(primary!.getChainId).not.toHaveBeenCalled();
+    expect(primary!.getSpecVersion).not.toHaveBeenCalled();
+    expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
+    expect(secondary!.getSpecVersion).toHaveBeenCalledTimes(1);
   });
 });

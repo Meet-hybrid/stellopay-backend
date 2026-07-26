@@ -80,6 +80,22 @@ describe("config env parsing", () => {
     await expect(import("./config")).rejects.toThrow();
   });
 
+  it("parses comma-separated Starknet RPC URLs into starknetRpcUrls", async () => {
+    const { starknetRpcUrls } = await loadConfig({
+      STARKNET_RPC_URL: "https://primary.example/rpc,https://backup.example/rpc",
+    });
+    expect(starknetRpcUrls).toEqual([
+      "https://primary.example/rpc",
+      "https://backup.example/rpc",
+    ]);
+  });
+
+  it("rejects plaintext Starknet RPC URLs", async () => {
+    await expect(
+      loadConfig({ STARKNET_RPC_URL: "http://insecure.example/rpc" }),
+    ).rejects.toThrow(/HTTPS/);
+  });
+
   it("resolves local ABI fallback paths in development", async () => {
     const { abiPaths } = await loadConfig({ NODE_ENV: "development" });
     expect(abiPaths.escrow).toContain("PayrollEscrow");
