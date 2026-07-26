@@ -25,7 +25,7 @@ vi.mock("../db/index.js", () => ({
   schema: {},
 }));
 
-import { diagnosticsRouter } from "./diagnostics.js";
+import { redactRecentEvent, diagnosticsRouter } from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 
@@ -79,6 +79,28 @@ function wireDbRows() {
     } as any);
 }
 
+describe("redactRecentEvent helper", () => {
+  it("strips sensitive transaction hashes, agreement IDs, and extra fields", () => {
+    const rawRow = {
+      event_type: "EscrowFunded",
+      created_at: "2026-07-26T18:00:00Z",
+      transaction_hash: "0xsecrettx",
+      agreement_id: "ag-999",
+      employer: "0xemployer",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted).toEqual({
+      event_type: "EscrowFunded",
+      created_at: "2026-07-26T18:00:00Z",
+    });
+    expect(redacted).not.toHaveProperty("transaction_hash");
+    expect(redacted).not.toHaveProperty("agreement_id");
+    expect(redacted).not.toHaveProperty("employer");
+  });
+});
+
 describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -102,6 +124,32 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(db.execute).not.toHaveBeenCalled();
   });
 
+  it("rejects requests when requireSession invalidates session", async () => {
+    vi.mocked(requireSession).mockResolvedValueOnce(false);
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(401);
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects requests missing authorization header or missing address header", async () => {
+    const resNoAuth = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set({ "x-user-address": ADMIN });
+
+    expect(resNoAuth.status).toBe(401);
+
+    const resNoAddress = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set({ authorization: "Bearer testtoken" });
+
+    expect(resNoAddress.status).toBe(401);
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
   it("allows an admin and returns aggregate counts", async () => {
     wireDbRows();
 
@@ -113,6 +161,17 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
     expect(getPoolStats).toHaveBeenCalledOnce();
+  });
+
+  it("handles case-insensitive admin address matching", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN.toUpperCase()));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalled();
   });
 
   it("redacts transaction hashes and agreement ids from recent events", async () => {
@@ -154,3 +213,4 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.status).toBe(500);
   });
 });
+
