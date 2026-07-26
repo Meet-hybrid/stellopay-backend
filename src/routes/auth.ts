@@ -44,7 +44,13 @@ authRouter.use((req, _res, next) => {
   next();
 });
 
-// Step 1: backend issues a nonce for wallet ownership proof
+// Step 1: backend issues a nonce for wallet ownership proof.
+//
+// IDEMPOTENCY: this endpoint is idempotent on retry within the active TTL window
+// because `createChallenge` in src/auth/challenge.ts returns the existing nonce
+// (and emits a `challenge_replayed` metric) rather than overwriting it. A retry
+// therefore CANNOT invalidate an in-flight verify attempt for the same address.
+// See docs/routes/auth.md for the per-endpoint idempotency contract.
 authRouter.post("/auth/challenge", async (req, res, next) => {
   try {
     const { address } = AddressBody.parse(req.body);
