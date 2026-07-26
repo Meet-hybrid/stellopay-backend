@@ -1,6 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { shortString } from "starknet";
-import { buildTypedChallenge } from "./challenge";
+import { 
+  buildTypedChallenge,
+  createChallenge,
+  getChallenge,
+  clearChallenge,
+  consumeChallenge,
+} from "./challenge";
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 // SN_SEPOLIA encoded as a felt short string, as the RPC provider returns it.
 const chainId = shortString.encodeShortString("SN_SEPOLIA");
@@ -26,5 +34,96 @@ describe("buildTypedChallenge", () => {
     expect(domain.name).toBe("StelloPay");
     expect(domain.version).toBe("1");
     expect(domain.revision).toBe("1");
+  });
+});
+
+describe("challenge management & telemetry", () => {
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    consoleInfoSpy.mockRestore();
+  });
+
+  it("issues an active challenge and logs creation", () => {
+    const { nonce, expires_in_ms } = createChallenge("0xAbC");
+    expect(nonce).toMatch(/^0x[0-9a-f]{32}$/);
+    expect(expires_in_ms).toBe(CHALLENGE_TTL_MS);
+    expect(getChallenge("0xabc")?.nonce).toBe(nonce);
+    
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_created"'));
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"address":"0xabc"'));
+  });
+
+  it("expires the challenge once the TTL elapses and logs expiry", () => {
+    createChallenge("0xdead");
+    consoleInfoSpy.mockClear();
+    
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+    expect(getChallenge("0xdead")).toBeNull();
+    
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_expired"'));
+  });
+
+  it("logs a miss when retrieving a non-existent challenge", () => {
+    expect(getChallenge("0xmissing")).toBeNull();
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_miss"'));
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"reason":"not_found"'));
+  });
+
+  it("returns null after a challenge is cleared and logs clearing", () => {
+    createChallenge("0xfeed");
+    consoleInfoSpy.mockClear();
+    
+    clearChallenge("0xfeed");
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_cleared"'));
+    
+    expect(getChallenge("0xfeed")).toBeNull();
+  });
+
+  it("consumeChallenge returns the record exactly once, then null on reuse", () => {
+    const { nonce } = createChallenge("0xC0FFEE");
+    consoleInfoSpy.mockClear();
+    
+    const first = consumeChallenge("0xc0ffee");
+    expect(first?.nonce).toBe(nonce);
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_consumed"'));
+    
+    consoleInfoSpy.mockClear();
+    const second = consumeChallenge("0xc0ffee");
+    expect(second).toBeNull();
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_miss"'));
+  });
+
+  it("consumeChallenge rejects an expired challenge instead of returning it", () => {
+    createChallenge("0xdeadbeef");
+    consoleInfoSpy.mockClear();
+    
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+    expect(consumeChallenge("0xdeadbeef")).toBeNull();
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_expired"'));
+  });
+
+  it("consumeChallenge deletes before any caller can read it again (closes the replay race)", () => {
+    createChallenge("0xrace");
+    consoleInfoSpy.mockClear();
+    
+    // Simulates two concurrent /auth/verify requests reading the same nonce:
+    // only the first should ever see a non-null record.
+    const attempt1 = consumeChallenge("0xrace");
+    const attempt2 = consumeChallenge("0xrace");
+    
+    expect(attempt1).not.toBeNull();
+    expect(attempt2).toBeNull(); // second fails because it's missing now
+    expect(getChallenge("0xrace")).toBeNull();
+    
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_consumed"'));
+    expect(consoleInfoSpy).toHaveBeenCalledWith(expect.stringContaining('"metric":"challenge_miss"'));
   });
 });

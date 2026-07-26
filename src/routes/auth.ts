@@ -1,10 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
-import { buildTypedChallenge } from "../auth/challenge.js";
+import { buildTypedChallenge, consumeChallenge, createChallenge } from "../auth/challenge.js";
 import {
-  consumeChallenge,
-  createChallenge,
   createSession,
   requireSession,
   revokeSession,

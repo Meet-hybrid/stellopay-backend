@@ -4,84 +4,11 @@ import { env } from "../config.js";
 import { db } from "../db/index.js";
 import { sessions as sessionsTable } from "../db/schema.js";
 
-type ChallengeRecord = {
-  nonce: string;
-  expiresAtMs: number;
-};
-
-const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = env.SESSION_TTL_MS;
 const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
-/**
- * Challenges are short-lived (5-minute TTL), cryptographic nonces used to prove wallet ownership.
- *
- * RATIONALE FOR IN-MEMORY RETENTION:
- * Challenges are highly transient. Storing them in-memory avoids unnecessary DB read/write overhead
- * for every unauthenticated challenge request. If the server restarts or a different instance
- * handles the verification, the user's wallet client simply requests a new challenge nonce with no
- * negative security implications and minimal user friction.
- */
-const challenges = new Map<string, ChallengeRecord>();
-
-/**
- * Generates a challenge nonce for verification.
- *
- * @param address - The user's Starknet wallet address
- * @returns The generated nonce and its TTL
- */
-export function createChallenge(address: string) {
-  const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
-  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: Date.now() + CHALLENGE_TTL_MS });
-  return { nonce, expires_in_ms: CHALLENGE_TTL_MS };
-}
-
-/**
- * Retrieves the challenge record for verification.
- *
- * @param address - The user's Starknet wallet address
- * @returns The challenge record if found and valid, otherwise null
- */
-export function getChallenge(address: string) {
-  const rec = challenges.get(address.toLowerCase());
-  if (!rec) return null;
-  if (Date.now() > rec.expiresAtMs) {
-    challenges.delete(address.toLowerCase());
-    return null;
-  }
-  return rec;
-}
-
-/**
- * Clears a challenge once verified.
- *
- * @param address - The user's Starknet wallet address
- */
-export function clearChallenge(address: string) {
-  challenges.delete(address.toLowerCase());
-}
-
-/**
- * Atomically reads and deletes the challenge for an address in a single step.
- *
- * This must be used (instead of getChallenge + a later clearChallenge) anywhere a
- * challenge is about to be verified. getChallenge is read-only, so if it's read at
- * the start of an async verification and only cleared afterwards, two concurrent
- * requests can both read the same still-valid nonce before either one clears it —
- * letting the same challenge be consumed twice (a replay bypass). Deleting it at
- * read time closes that gap: the second concurrent caller sees it already gone.
- *
- * @param address - The user's Starknet wallet address
- * @returns The challenge record if it existed and was still valid, otherwise null
- */
-export function consumeChallenge(address: string) {
-  const rec = getChallenge(address);
-  if (!rec) return null;
-  challenges.delete(address.toLowerCase());
-  return rec;
-}
 
 /**
  * Creates a new session in PostgreSQL for the given wallet address.
