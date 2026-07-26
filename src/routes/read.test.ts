@@ -1,7 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
 import { readRouter } from "./read.js";
+import { provider } from "../starknet/client.js";
+import { env } from "../config.js";
 
 // Mock starknet client
 const mockEscrow = {
@@ -91,6 +93,112 @@ describe("read routes", () => {
         mode: 0,
         dispute_status: 2,
       });
+    });
+  });
+
+  describe("telemetry and error logs", () => {
+    let infoSpy: any;
+    let errorSpy: any;
+    let originalLogFormat: string;
+
+    beforeEach(() => {
+      infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      originalLogFormat = env.LOG_FORMAT;
+    });
+
+    afterEach(() => {
+      infoSpy.mockRestore();
+      errorSpy.mockRestore();
+      env.LOG_FORMAT = originalLogFormat;
+    });
+
+    it("logs structured JSON info on successful token decimals read", async () => {
+      env.LOG_FORMAT = "json";
+      vi.mocked(provider.callContract).mockResolvedValue(["18"]);
+
+      await request(makeApp())
+        .get("/api/v1/token/0x1234/decimals")
+        .expect(200);
+
+      expect(infoSpy).toHaveBeenCalled();
+      const logs = infoSpy.mock.calls.map((call: any) => JSON.parse(call[0]));
+      const tokenLog = logs.find((l: any) => l.operation === "erc20_decimals");
+      expect(tokenLog).toBeDefined();
+      expect(tokenLog.status).toBe("success");
+      expect(tokenLog.token).toBe("0x1234");
+      expect(typeof tokenLog.duration_ms).toBe("number");
+    });
+
+    it("logs structured JSON error on failed token symbol read", async () => {
+      env.LOG_FORMAT = "json";
+      vi.mocked(provider.callContract).mockRejectedValue(new Error("RPC Timeout"));
+
+      await request(makeApp())
+        .get("/api/v1/token/0x1234/symbol")
+        .expect(500);
+
+      expect(errorSpy).toHaveBeenCalled();
+      const logs = errorSpy.mock.calls.map((call: any) => JSON.parse(call[0]));
+      const tokenLog = logs.find((l: any) => l.operation === "erc20_symbol");
+      expect(tokenLog).toBeDefined();
+      expect(tokenLog.status).toBe("error");
+      expect(tokenLog.error).toBe("RPC Timeout");
+    });
+
+    it("logs text format info on successful escrow balance read", async () => {
+      env.LOG_FORMAT = "text";
+      mockEscrow.get_agreement_balance.mockResolvedValue({ low: 500n, high: 0n });
+
+      await request(makeApp())
+        .get("/api/v1/escrow/0x1234/balance/7")
+        .expect(200);
+
+      expect(infoSpy).toHaveBeenCalled();
+      const logString = infoSpy.mock.calls[0][0];
+      expect(logString).toContain("[read-telemetry] escrow_get_agreement_balance success");
+      expect(logString).toContain("ms");
+    });
+
+    it("logs structured JSON error on failed escrow summary read", async () => {
+      env.LOG_FORMAT = "json";
+      mockEscrow.get_token.mockRejectedValue(new Error("Escrow contract offline"));
+
+      await request(makeApp())
+        .get("/api/v1/escrow/0x1234/summary/1")
+        .expect(500);
+
+      expect(errorSpy).toHaveBeenCalled();
+      const logs = errorSpy.mock.calls.map((call: any) => JSON.parse(call[0]));
+      const escrowLog = logs.find((l: any) => l.operation === "escrow_get_summary");
+      expect(escrowLog).toBeDefined();
+      expect(escrowLog.status).toBe("error");
+      expect(escrowLog.error).toBe("Escrow contract offline");
+    });
+
+    it("logs structured JSON info on successful agreement summary read", async () => {
+      env.LOG_FORMAT = "json";
+      mockAgreement.get_employer.mockResolvedValue(100n);
+      mockAgreement.get_contributor.mockResolvedValue("0x200");
+      mockAgreement.get_token.mockResolvedValue(300n);
+      mockAgreement.get_escrow.mockResolvedValue(400n);
+      mockAgreement.get_total_amount.mockResolvedValue({ low: 1000n, high: 0n });
+      mockAgreement.get_paid_amount.mockResolvedValue({ low: 500n, high: 0n });
+      mockAgreement.get_status.mockResolvedValue(1n);
+      mockAgreement.get_agreement_mode.mockResolvedValue(0n);
+      mockAgreement.get_dispute_status.mockResolvedValue(2n);
+
+      await request(makeApp())
+        .get("/api/v1/agreement/0x5678/summary/2")
+        .expect(200);
+
+      expect(infoSpy).toHaveBeenCalled();
+      const logs = infoSpy.mock.calls.map((call: any) => JSON.parse(call[0]));
+      const agreementLog = logs.find((l: any) => l.operation === "agreement_get_summary");
+      expect(agreementLog).toBeDefined();
+      expect(agreementLog.status).toBe("success");
+      expect(agreementLog.agreement).toBe("0x5678");
+      expect(agreementLog.agreement_id).toBe("2");
     });
   });
 });
