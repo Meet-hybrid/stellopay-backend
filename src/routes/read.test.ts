@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { readRouter } from "./read.js";
+import { readRouter, CursorPaginationSchema, BatchReadSchema } from "./read.js";
 
 // Mock starknet client
 const mockEscrow = {
@@ -94,32 +94,31 @@ describe("read routes", () => {
     });
   });
 
-  describe("GET /records/cursor/:address", () => {
-    it("returns 401 when missing authorization header", async () => {
-      await request(makeApp())
-        .get("/api/v1/records/cursor/0x1234")
-        .expect(401);
+  describe("Pagination and Batching Schemas", () => {
+    it("CursorPaginationSchema should apply defaults and limits", () => {
+      const { CursorPaginationSchema } = require("./read.js");
+      const defaultRes = CursorPaginationSchema.parse({});
+      expect(defaultRes.limit).toBe(50);
+      expect(defaultRes.cursor).toBeUndefined();
+
+      const customRes = CursorPaginationSchema.parse({ cursor: "abc", limit: 10 });
+      expect(customRes.limit).toBe(10);
+      expect(customRes.cursor).toBe("abc");
+
+      // Boundary tests
+      expect(() => CursorPaginationSchema.parse({ limit: 0 })).toThrow();
+      expect(() => CursorPaginationSchema.parse({ limit: 101 })).toThrow();
     });
 
-    it("returns 403 when authorization token doesn't match address", async () => {
-      await request(makeApp())
-        .get("/api/v1/records/cursor/0x1234")
-        .set("Authorization", "Bearer 0x5678")
-        .expect(403);
-    });
+    it("BatchReadSchema should enforce array limits and valid items", () => {
+      const { BatchReadSchema } = require("./read.js");
+      const valid = BatchReadSchema.parse({ ids: ["1", "2"] });
+      expect(valid.ids.length).toBe(2);
 
-    it("returns 200 and parses cursor and order correctly", async () => {
-      const res = await request(makeApp())
-        .get("/api/v1/records/cursor/0x1234?cursor=next-page&order=asc&limit=10")
-        .set("Authorization", "Bearer 0x1234")
-        .expect(200);
-
-      expect(res.body).toEqual({
-        address: "0x1234",
-        records: [],
-        nextCursor: null,
-        order: "asc",
-      });
+      // Boundary tests
+      expect(() => BatchReadSchema.parse({ ids: [] })).toThrow();
+      const largeArray = Array.from({ length: 51 }, (_, i) => BigInt(i + 1));
+      expect(() => BatchReadSchema.parse({ ids: largeArray })).toThrow();
     });
   });
 });

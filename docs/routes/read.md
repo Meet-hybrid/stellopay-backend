@@ -1,35 +1,39 @@
-# Cursor-Based Reads API Contract
+# Read Route Documentation
 
-This document describes the API contract for the cursor-based reads and record ordering endpoints owned by `src/routes/read.ts`.
+This document defines the strict contracts for pagination and batching across `src/routes/read.ts` and its consumers.
 
-## `GET /api/v1/records/cursor/:address`
+## Cursor-Based Pagination
 
-Retrieves a paginated list of records for a specific address using cursor-based pagination.
+When an endpoint supports cursor-based pagination to read streams of events or records, it MUST use `CursorPaginationSchema` to validate the incoming query parameters. 
 
-### Authentication
+```typescript
+export const CursorPaginationSchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+```
+- **limit**: Caps results per page. Minimum 1, Maximum 100, Default 50.
+- **cursor**: A string representing the starting position for the next page. 
 
-This endpoint strictly requires a bearer token in the `Authorization` header. The token must exactly match the `:address` path parameter to verify privilege and prevent access authorization gaps (drift).
+The successful response MUST match the generic `PaginatedReadResponse<T>` shape:
 
-**Header:**
-`Authorization: Bearer <address>`
+```typescript
+export interface PaginatedReadResponse<T> {
+  data: T[]; // The actual array of records
+  nextCursor: string | null; // The cursor to use for the next page, or null if there are no more pages
+  hasMore: boolean; // True if there are more records remaining
+  limit: number; // The limit that was applied to the query
+}
+```
 
-### Query Parameters
+## Batching
 
-- `cursor` (string, optional): A token used to fetch the next page of records.
-- `order` (enum: `asc`, `desc`): The ordering of the records. Defaults to `desc`.
-- `limit` (number, optional): The number of records to return. Min: 1, Max: 100. Defaults to 50.
+When reading multiple discrete items by their ID (e.g. fetching summaries for multiple agreements), endpoints MUST use `BatchReadSchema` to prevent oversized queries or resource exhaustion.
 
-### Responses
-
-- **200 OK**:
-  ```json
-  {
-    "address": "0x1234",
-    "records": [],
-    "nextCursor": null,
-    "order": "desc"
-  }
-  ```
-
-- **401 Unauthorized**: If the `Authorization` header is missing.
-- **403 Forbidden**: If the `Authorization` token fails the privilege check (i.e., does not match the target address).
+```typescript
+export const BatchReadSchema = z.object({
+  ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
+});
+```
+- **ids**: A non-empty array of positive bigints.
+- **Max Batch Size**: Hardcoded to 50 items per request to keep RPC calls and database lookups constrained.
