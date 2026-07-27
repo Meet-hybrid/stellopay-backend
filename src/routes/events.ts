@@ -542,7 +542,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
 
     res.json({
       message: `Processed ${result.eventsProcessed} events`,
-      eventsProcessed: result.eventLabels,
+      eventsProcessed: result.eventsProcessed,
       transactionHash: result.txHash,
       tokenVerified: result.tokenVerified,
     });
