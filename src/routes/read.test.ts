@@ -93,4 +93,33 @@ describe("read routes", () => {
       });
     });
   });
+
+  describe("GET /records/cursor/:address", () => {
+    it("returns 401 when missing authorization header", async () => {
+      await request(makeApp())
+        .get("/api/v1/records/cursor/0x1234")
+        .expect(401);
+    });
+
+    it("returns 403 when authorization token doesn't match address", async () => {
+      await request(makeApp())
+        .get("/api/v1/records/cursor/0x1234")
+        .set("Authorization", "Bearer 0x5678")
+        .expect(403);
+    });
+
+    it("returns 200 and parses cursor and order correctly", async () => {
+      const res = await request(makeApp())
+        .get("/api/v1/records/cursor/0x1234?cursor=next-page&order=asc&limit=10")
+        .set("Authorization", "Bearer 0x1234")
+        .expect(200);
+
+      expect(res.body).toEqual({
+        address: "0x1234",
+        records: [],
+        nextCursor: null,
+        order: "asc",
+      });
+    });
+  });
 });
