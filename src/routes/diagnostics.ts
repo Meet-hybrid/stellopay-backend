@@ -133,11 +133,15 @@ export async function fetchDiagnosticsData(dbClient = db) {
  * list is redacted to event type and timestamp only. Every query is static and
  * parameter free, so no request input ever reaches the SQL.
  */
+// NOTE: requireAuth/requireAdmin are already applied router-wide above.
+// Repeating them here is intentional, redundant enforcement (see
+// docs/routes/diagnostics.md — "Dual Enforcement"), not a leftover to
+// clean up. Do not remove without updating the docs' compatibility notes.
 diagnosticsRouter.get(
   "/diagnostics/events",
-  requireAuth,
-  requireAdmin,
-  async (_req, res, next) => {
+    requireAuth,
+      requireAdmin,
+        async (_req, res, next) => {
     try {
       const data = await fetchDiagnosticsData();
       res.json(data);
