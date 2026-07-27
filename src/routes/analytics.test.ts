@@ -64,7 +64,7 @@ vi.mock("drizzle-orm", () => ({
   sql: vi.fn(() => "sql-expr"),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, parseBigIntSafe, isValidMonth } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
 
@@ -293,5 +293,69 @@ describe("analytics telemetry and error logs", () => {
     // A Zod parse failure before any DB call still hits our catch block, so
     // we verify the log is written but no DB queries ran.
     expect(queryState.eqValues).toHaveLength(0);
+  });
+});
+
+describe("analytics helper unit tests & input hardening", () => {
+  describe("parseBigIntSafe", () => {
+    it("safely converts valid string, bigint, and number inputs", () => {
+      expect(parseBigIntSafe("1000")).toBe(1000n);
+      expect(parseBigIntSafe(500n)).toBe(500n);
+      expect(parseBigIntSafe(250)).toBe(250n);
+    });
+
+    it("returns 0n for missing, empty, or malformed inputs without throwing", () => {
+      expect(parseBigIntSafe(null)).toBe(0n);
+      expect(parseBigIntSafe(undefined)).toBe(0n);
+      expect(parseBigIntSafe("")).toBe(0n);
+      expect(parseBigIntSafe("not-a-number")).toBe(0n);
+      expect(parseBigIntSafe("12.34")).toBe(0n);
+      expect(parseBigIntSafe(NaN)).toBe(0n);
+    });
+  });
+
+  describe("isValidMonth", () => {
+    it("returns true for valid months (1 to 12)", () => {
+      expect(isValidMonth(1)).toBe(true);
+      expect(isValidMonth(12)).toBe(true);
+      expect(isValidMonth("6")).toBe(true);
+    });
+
+    it("returns false for out-of-bounds or non-integer months", () => {
+      expect(isValidMonth(0)).toBe(false);
+      expect(isValidMonth(13)).toBe(false);
+      expect(isValidMonth(-1)).toBe(false);
+      expect(isValidMonth("abc")).toBe(false);
+    });
+  });
+
+  describe("boundary & robustness integration tests", () => {
+    it("handles empty year parameter (?year=) by defaulting to current year", async () => {
+      const res = await request(makeApp()).get("/api/v1/analytics/abc?year=").expect(200);
+      expect(res.body.year).toBe(new Date().getFullYear());
+    });
+
+    it("rejects non-integer year with 400", async () => {
+      await request(makeApp()).get("/api/v1/analytics/abc?year=2026.5").expect(400);
+    });
+
+    it("rejects non-numeric string year with 400", async () => {
+      await request(makeApp()).get("/api/v1/analytics/abc?year=invalid").expect(400);
+    });
+
+    it("gracefully handles DB rows with unparseable amounts and invalid month numbers", async () => {
+      const address = normalizeStarknetAddress("abc");
+      queryState.rows.payments = [
+        { month: 1, amount: "invalid-amount", to: address },
+        { month: 99, amount: "5000000", to: address },
+      ];
+      queryState.rows.escrowEvents = [
+        { month: 2, amount: null, eventType: "Released", to: address },
+      ];
+
+      const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+      expect(res.body.data).toHaveLength(12);
+      expect(res.body.total).toBe(0);
+    });
   });
 });
