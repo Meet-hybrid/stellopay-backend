@@ -26,6 +26,8 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       .select({
         month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
         amount: schema.payments.amount,
+        from: schema.payments.from,
+        to: schema.payments.to,
       })
       .from(schema.payments)
       .where(
@@ -42,6 +44,8 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
         amount: schema.escrowEvents.amount,
         eventType: schema.escrowEvents.eventType,
+        employer: schema.escrowEvents.employer,
+        to: schema.escrowEvents.to,
       })
       .from(schema.escrowEvents)
       .where(
@@ -101,8 +105,12 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     payments.forEach((p) => {
       const month = Number(p.month);
       const amount = BigInt(p.amount);
-      // For received payments, add; for sent payments, we'll track net
-      monthlyData[month] = (monthlyData[month] || 0n) + amount;
+      if (p.from === userAddress) {
+        monthlyData[month] = (monthlyData[month] || 0n) - amount;
+      }
+      if (p.to === userAddress) {
+        monthlyData[month] = (monthlyData[month] || 0n) + amount;
+      }
     });
 
     // Add escrow events (funding is negative, releases/refunds are positive)
@@ -110,9 +118,17 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       const month = Number(e.month);
       const amount = BigInt(e.amount);
       if (e.eventType === "Funded") {
-        monthlyData[month] = (monthlyData[month] || 0n) - amount; // Funding is outgoing
-      } else {
-        monthlyData[month] = (monthlyData[month] || 0n) + amount; // Releases/refunds are incoming
+        if (e.employer === userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) - amount; // Funding is outgoing
+        }
+      } else if (e.eventType === "Released") {
+        if (e.to === userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) + amount; // Releases are incoming
+        }
+      } else if (e.eventType === "Refunded") {
+        if (e.employer === userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) + amount; // Refunds are incoming
+        }
       }
     });
 
@@ -125,13 +141,16 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     });
 
     // If no payments/escrow events, use agreement counts for visualization
-    // Multiply by a base amount to make it visible on chart
-    Object.keys(agreementCountsByMonth).forEach((monthStr) => {
-      const month = Number(monthStr);
-      const count = agreementCountsByMonth[month];
-      // Use a base value (e.g., 1000 per agreement) for visualization when no payments exist
-      monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
-    });
+    const hasFinancialActivity = payments.length > 0 || escrowEvents.length > 0;
+    if (!hasFinancialActivity) {
+      // Multiply by a base amount to make it visible on chart
+      Object.keys(agreementCountsByMonth).forEach((monthStr) => {
+        const month = Number(monthStr);
+        const count = agreementCountsByMonth[month];
+        // Use a base value (e.g., 1000 per agreement) for visualization when no payments exist
+        monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
+      });
+    }
 
     // Convert to chart format. Monthly amounts are u256 base units summed in
     // BigInt space, so they can exceed Number.MAX_SAFE_INTEGER. Divide
