@@ -1,7 +1,16 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { reprocessEventsRouter, __resetRetryCounts, RETRY_BUDGET, QUARANTINE_PATH } from "./reprocess-events.js";
+import {
+  reprocessEventsRouter,
+  __resetRetryCounts,
+  __resetReprocessLocks,
+  acquireReprocessLock,
+  releaseReprocessLock,
+  getReprocessingLockStatus,
+  RETRY_BUDGET,
+  QUARANTINE_PATH,
+} from "./reprocess-events.js";
 import fs from "fs";
 import path from "path";
 import { eventsRouter } from "./events.js";
@@ -98,8 +107,9 @@ describe("Reprocess Events Routes", () => {
     vi.clearAllMocks();
     global.fetch = fetchMock as any;
 
-    // Reset retry counts for isolation
+    // Reset retry counts and lock states for isolation
     __resetRetryCounts();
+    __resetReprocessLocks();
 
     // Ensure quarantine directory is clean
     if (fs.existsSync(QUARANTINE_PATH)) {
@@ -923,6 +933,106 @@ it("should quarantine after exceeding retry budget", async () => {
       expect(res.body.summary.duplicates).toBe(0);
       expect(res.body.summary.total).toBe(2);
       expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("In-flight Idempotency Guard (HTTP 409)", () => {
+    it("returns HTTP 409 when a second call is made while reprocessing is in-flight", async () => {
+      let resolveFirstCall: (value: any) => void;
+      const slowReceiptPromise = new Promise((resolve) => {
+        resolveFirstCall = resolve;
+      });
+
+      mockGetTransactionReceipt.mockImplementationOnce(() => slowReceiptPromise);
+
+      const txHash = "0x1234567890abcdef";
+
+      // Trigger first reprocess request (starts running and acquires lock)
+      const firstReq = request(app).post(`/api/v1/reprocess-events/tx/${txHash}`);
+
+      // Wait briefly to ensure first request enters the handler and acquires the lock
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Trigger second concurrent request while first is in-flight
+      const secondRes = await request(app)
+        .post(`/api/v1/reprocess-events/tx/${txHash}`)
+        .expect(409);
+
+      expect(secondRes.body.error).toBe("Reprocessing operation already in progress");
+
+      // Resolve the first request
+      resolveFirstCall!({
+        transaction_hash: txHash,
+        blockNumber: 100,
+        events: [],
+      });
+
+      const firstRes = await firstReq;
+      expect(firstRes.status).toBe(200);
+
+      // Verify that after completion, the lock is released and a new request succeeds
+      mockGetTransactionReceipt.mockResolvedValueOnce({
+        transaction_hash: txHash,
+        blockNumber: 101,
+        events: [],
+      });
+
+      const thirdRes = await request(app)
+        .post(`/api/v1/reprocess-events/tx/${txHash}`)
+        .expect(200);
+      expect(thirdRes.body.message).toBe("Events reprocessed");
+    });
+
+    it("reliably releases the lock even if the route handler throws an exception", async () => {
+      mockGetTransactionReceipt.mockRejectedValue(new Error("Fatal RPC Error"));
+
+      const txHash = "0x1234567890abcdef";
+
+      // First call throws / fails
+      await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(500);
+
+      // Verify the lock was released despite the error
+      expect(getReprocessingLockStatus()).toBe(false);
+
+      // Succeed on subsequent call
+      mockGetTransactionReceipt.mockResolvedValueOnce({
+        transaction_hash: txHash,
+        blockNumber: 100,
+        events: [],
+      });
+
+      const nextRes = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
+      expect(nextRes.body.message).toBe("Events reprocessed");
+    });
+
+    it("rejects concurrent /status-changes calls with 409", async () => {
+      // Manually acquire lock to simulate an in-flight background job
+      acquireReprocessLock();
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/status-changes")
+        .expect(409);
+
+      expect(res.body.error).toBe("Reprocessing operation already in progress");
+
+      releaseReprocessLock();
+
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const nextRes = await request(app)
+        .post("/api/v1/reprocess-events/status-changes")
+        .expect(200);
+
+      expect(nextRes.body.message).toContain("Reprocessed 0 events");
+      selectMock.mockRestore();
     });
   });
 });

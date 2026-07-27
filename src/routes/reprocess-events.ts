@@ -44,6 +44,42 @@ export function __resetRetryCounts() {
   retryCounts.clear();
 }
 
+/** Global in-memory lock state tracking active reprocess tasks. */
+let isReprocessingActive = false;
+
+/**
+ * Check whether a reprocessing operation is currently in progress.
+ */
+export function getReprocessingLockStatus(): boolean {
+  return isReprocessingActive;
+}
+
+/**
+ * Attempt to acquire the reprocessing lock.
+ * @returns `true` if lock was successfully acquired; `false` if already locked.
+ */
+export function acquireReprocessLock(): boolean {
+  if (isReprocessingActive) {
+    return false;
+  }
+  isReprocessingActive = true;
+  return true;
+}
+
+/**
+ * Release the reprocessing lock.
+ */
+export function releaseReprocessLock(): void {
+  isReprocessingActive = false;
+}
+
+/**
+ * Reset in-memory reprocessing lock state. Exported for tests to ensure isolation.
+ */
+export function __resetReprocessLocks(): void {
+  isReprocessingActive = false;
+}
+
 /** Normalise a transaction hash to the canonical 0x + 64‑hex form. */
 function normaliseHash(hash: string): string {
   const lower = hash.toLowerCase();
@@ -102,6 +138,10 @@ reprocessEventsRouter.post(
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    if (!acquireReprocessLock()) {
+      res.status(409).json({ error: "Reprocessing operation already in progress" });
+      return;
+    }
     try {
       const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
       const result = await processTxReceipt(tx_hash);
@@ -128,6 +168,8 @@ reprocessEventsRouter.post(
       // For non‑quarantined errors, include attempt count for backward compatibility info
       res.status(500).json({ attempts: retry.attempts, error: retry.error });
       return;
+    } finally {
+      releaseReprocessLock();
     }
   },
 );
@@ -138,6 +180,10 @@ reprocessEventsRouter.post(
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    if (!acquireReprocessLock()) {
+      res.status(409).json({ error: "Reprocessing operation already in progress" });
+      return;
+    }
     try {
       const { tx_hashes } = z
         .object({
@@ -202,6 +248,8 @@ reprocessEventsRouter.post(
         return;
       }
       next(e);
+    } finally {
+      releaseReprocessLock();
     }
   },
 );
@@ -212,6 +260,10 @@ reprocessEventsRouter.post(
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    if (!acquireReprocessLock()) {
+      res.status(409).json({ error: "Reprocessing operation already in progress" });
+      return;
+    }
     try {
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
@@ -313,6 +365,8 @@ reprocessEventsRouter.post(
         return;
       }
       next(e);
+    } finally {
+      releaseReprocessLock();
     }
   },
 );
