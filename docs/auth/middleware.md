@@ -16,6 +16,32 @@ truth and the implementation needs fixing.
 from drifting as new routers are added, and gives the test suite one place to
 exercise the boundary instead of N places.
 
+## Idempotency contract
+
+Both middlewares are idempotent: calling them multiple times in the same
+request has the same effect as calling them once. This protects against
+accidental double-application (e.g. middleware applied at both router and
+route level) and request retry scenarios.
+
+**`requireAuth` idempotency.** Once `req.auth` is populated with both
+`address` and `token`, subsequent calls skip header parsing, session
+validation, and every other side-effect — they immediately call `next()`.
+The original resolved principal is preserved even if a second call presents
+different headers.
+
+**`requireAdmin` idempotency.** Once admin authorization succeeds, the
+result is cached in `res.locals.adminAuthorized`. Subsequent calls skip the
+allowlist comparison and call `next()` immediately. The cached decision
+survives even if `env.ADMIN_ADDRESSES` were hypothetically mutated between
+calls (it is not during normal request lifecycle).
+
+**Non-idempotent scope.** The `res.status().json()` failure paths
+(401/403) are intentionally **not** idempotent under Express semantics:
+once `res.json()` has been called, a second call triggers an
+`ERR_HTTP_HEADERS_SENT` crash. This is correct — if a middleware sends a
+response, no further middleware or route handler should run. The idempotency
+guard prevents this scenario by short-circuiting before any response is sent.
+
 ## Principal resolution — `requireAuth`
 
 `requireAuth` resolves the principal from the request headers and binds it
@@ -108,11 +134,15 @@ asserts `req.auth` is present, so it MUST run after `requireAuth`.
   throwing session lookup).
 - `requireAuth` success path (lowercased address stored, raw token
   stored, next called).
+- `requireAuth` idempotency paths (second call skips re-validation,
+  original principal preserved when headers change between calls).
 - `requireAdmin` 401 path (missing `req.auth`, empty address).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).
 - `requireAdmin` success paths including canonical padding equivalence
   between admin and principal.
+- `requireAdmin` idempotency paths (second call skips allowlist check,
+  cached decision survives allowlist mutations).
 
 `src/routes/diagnostics.test.ts` exercises the boundary end-to-end with
 the real middlewares and a mocked session, so changing the

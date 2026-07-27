@@ -24,12 +24,53 @@ describe("Auth Middleware", () => {
     mockRes = {
       status: vi.fn().mockReturnThis(),
       json: vi.fn(),
+      locals: {},
     };
 
     mockNext = vi.fn();
   });
 
   describe("requireAuth", () => {
+    it("is idempotent: second call skips session re-validation", async () => {
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(true);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockNext).toHaveBeenCalledTimes(1);
+
+      mockNext = vi.fn();
+      vi.mocked(requireSession).mockClear();
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockNext).toHaveBeenCalledTimes(1);
+    });
+
+    it("is idempotent: second call preserves original req.auth even with different headers", async () => {
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(true);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockReq.auth).toEqual({ address: "0xuser", token: "valid_token" });
+
+      mockNext = vi.fn();
+      vi.mocked(requireSession).mockClear();
+      mockReq.headers = {
+        "x-user-address": "0xattacker",
+        authorization: "Bearer stolen_token",
+      };
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockReq.auth).toEqual({ address: "0xuser", token: "valid_token" });
+    });
+
     it("returns 401 if the x-user-address header is missing", async () => {
       mockReq.headers = { authorization: "Bearer valid_token" };
       await requireAuth(mockReq as Request, mockRes as Response, mockNext);
@@ -264,6 +305,32 @@ describe("Auth Middleware", () => {
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
+    });
+
+    it("is idempotent: second call skips re-authorization and does not re-check allowlist", () => {
+      mockReq.auth = { address: "0xabc1", token: "testtoken" };
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockNext).toHaveBeenCalledTimes(1);
+
+      mockNext = vi.fn();
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockNext).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).not.toHaveBeenCalledWith(403);
+    });
+
+    it("is idempotent: second call skips even if allowlist changes between calls", () => {
+      mockReq.auth = { address: "0xabc1", token: "testtoken" };
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockNext).toHaveBeenCalledTimes(1);
+
+      mockNext = vi.fn();
+      env.ADMIN_ADDRESSES = ["0xdef1"];
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockNext).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).not.toHaveBeenCalledWith(403);
     });
   });
 });
