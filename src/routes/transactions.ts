@@ -225,6 +225,7 @@ function formatAmount(amount: string | bigint, tokenInfo: TokenInfo): string {
 
 const tokenCache = new Map<string, { token: string; timestamp: number }>();
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_FETCH_BATCH_SIZE = 10;
 
 /** Fetches the token address for a single agreement from its on-chain contract. */
 async function getTokenFromAgreementContract(
@@ -263,7 +264,7 @@ async function getTokenFromAgreementContract(
 
 /**
  * Batches token fetches from agreement contracts, checking the cache first
- * and limiting RPC concurrency to BATCH_SIZE.
+ * and limiting RPC concurrency to TOKEN_FETCH_BATCH_SIZE.
  */
 async function batchGetTokensFromAgreementContracts(
   agreements: Array<{ agreementContractAddress: string; agreementId: string }>,
@@ -292,9 +293,9 @@ async function batchGetTokensFromAgreementContracts(
     `[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`,
   );
 
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < uncachedAgreements.length; i += BATCH_SIZE) {
-    const batch = uncachedAgreements.slice(i, i + BATCH_SIZE);
+
+  for (let i = 0; i < uncachedAgreements.length; i += TOKEN_FETCH_BATCH_SIZE) {
+    const batch = uncachedAgreements.slice(i, i + TOKEN_FETCH_BATCH_SIZE);
     const fetchPromises = batch.map(async (agreement) => {
       try {
         const token = await getTokenFromAgreementContract(
@@ -389,14 +390,35 @@ function formatEventType(eventType: string): string {
  * - Missing or invalid `offset` defaults to 0.
  * - Requested values > 100 are silently clamped to 100.
  */
-function parsePagination(req: {
-  query: Record<string, unknown>;
-}): { limit: number; offset: number } {
-  const requestedLimit =
-    z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
-  const limit = Math.min(requestedLimit, 100);
-  const offset =
-    z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
+/** Maximum allowed limit per page (configurable via env). */
+const MAX_LIMIT = env.TRANSACTIONS_MAX_LIMIT ? Number(env.TRANSACTIONS_MAX_LIMIT) : 100;
+const DEFAULT_LIMIT = 50;
+/**
+ * Parses `limit` and `offset` from request query, applying the pagination contract.
+ *
+ * - `limit` defaults to 50 and is clamped to the range [1, MAX_LIMIT].
+ * - `offset` defaults to 0 and must be non‑negative.
+ * - Values exceeding `MAX_LIMIT` are silently reduced to `MAX_LIMIT`.
+ */
+function parsePagination(req: { query: Record<string, unknown> }): { limit: number; offset: number } {
+  const rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
+  const rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+
+  const limit = typeof rawLimit === "number" ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
+  const offset = typeof rawOffset === "number" ? rawOffset : 0;
+
+  if (limit < 1) {
+    const err = new Error("`limit` must be a positive integer");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
+  if (offset < 0) {
+    const err = new Error("`offset` must be a non‑negative integer");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
   return { limit, offset };
 }
 
@@ -834,44 +856,18 @@ async function fetchAndBuildTransactions(
       const isReceived = p.eventType === "PaymentReceived";
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-
-    const allTransactions: TransactionRecord[] = [
-      ...uniqueAgreementEvents.map((a) => {
-        const dateTime = formatDate(a.createdAt);
-        return {
-          id: a.transactionHash.slice(0, 10), type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: a.transactionHash, createdAt: a.createdAt,
-        };
-      }),
-      ...payments.map((p) => {
-        const dateTime = formatDate(p.createdAt);
-        const tokenInfo = getTokenInfo(p.token);
-        const amountStr = formatAmount(p.amount, tokenInfo);
-        const isReceived = p.eventType === "PaymentReceived";
-        const sign = isReceived ? "+" : "-";
-        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-
       return {
-        id: e.transactionHash.slice(0, 10),
-        type:
-          e.eventType === "Funded"
-            ? "Agreement Funded"
-            : e.eventType === "Released"
-              ? "Payment Released"
-              : "Refund Received",
-        address: formatAddress(
-          e.eventType === "Funded" ? e.employer : e.to || "",
-        ),
+        id: p.transactionHash.slice(0, 10),
+        type: formatEventType(p.eventType),
+        address: formatAddress(p.to || p.from || "N/A"),
         date: dateTime.date,
         time: dateTime.time,
         token: tokenInfo.name,
         amount: finalAmount,
         status: "Completed" as const,
         tokenIcon: tokenInfo.icon,
-        txHash: e.transactionHash,
-        createdAt: e.createdAt,
+        txHash: p.transactionHash,
+        createdAt: p.createdAt,
       };
     }),
     ...employeeEvents.map((e) => {

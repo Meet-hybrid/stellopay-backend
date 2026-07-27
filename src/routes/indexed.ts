@@ -2,6 +2,8 @@ import { Router } from "express";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
+import { defaults } from "../config.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
 
 export const indexedRouter = Router();

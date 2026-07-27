@@ -268,6 +268,16 @@ describe("Transactions Router — main endpoint", () => {
       expect(res.status).toBe(200);
       expect(res.body.offset).toBe(0);
     });
+
+    it("returns 400 for non‑positive limit", async () => {
+      const res = await request(app).get(`/transactions/${USER_ADDRESS}?limit=0`);
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 for negative offset", async () => {
+      const res = await request(app).get(`/transactions/${USER_ADDRESS}?offset=-5`);
+      expect(res.status).toBe(400);
+    });
   });
 
   describe("event type filtering", () => {

@@ -1,7 +1,9 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { reprocessEventsRouter } from "./reprocess-events.js";
+import { reprocessEventsRouter, __resetRetryCounts, RETRY_BUDGET, QUARANTINE_PATH } from "./reprocess-events.js";
+import fs from "fs";
+import path from "path";
 import { eventsRouter } from "./events.js";
 import { db } from "../db/index.js";
 
@@ -95,6 +97,14 @@ describe("Reprocess Events Routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     global.fetch = fetchMock as any;
+
+    // Reset retry counts for isolation
+    __resetRetryCounts();
+
+    // Ensure quarantine directory is clean
+    if (fs.existsSync(QUARANTINE_PATH)) {
+      fs.rmSync(QUARANTINE_PATH, { recursive: true, force: true });
+    }
 
     // Set up test express app
     app = express();
@@ -244,6 +254,22 @@ describe("Reprocess Events Routes", () => {
 
       expect(res.body.error).toBe("RPC Connection Fail");
     });
+
+it("should quarantine after exceeding retry budget", async () => {
+  const txHash = "0xabc";
+  // First three attempts fail
+  mockGetTransactionReceipt.mockRejectedValue(new Error("Transient error"));
+  await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(500);
+  await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(500);
+  await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(500);
+  // Fourth attempt should be quarantined
+  const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
+  expect(res.body.message).toBe("Transaction quarantined after repeated failures");
+  expect(res.body.attempts).toBe(4);
+  const norm = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+  const quarantineFile = path.join(QUARANTINE_PATH, `${norm}.json`);
+  expect(fs.existsSync(quarantineFile)).toBe(true);
+});
   });
 
   describe("POST /reprocess-events/status-changes", () => {

@@ -542,7 +542,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
 
     res.json({
       message: `Processed ${result.eventsProcessed} events`,
-      eventsProcessed: result.eventLabels,
+      eventsProcessed: result.eventsProcessed,
       transactionHash: result.txHash,
       tokenVerified: result.tokenVerified,
     });
@@ -605,46 +605,48 @@ eventsRouter.post(
         })
         .parse(req.body);
 
-    const results: TxProcessResult[] = [];
-    const resultsByNormalizedHash = new Map<string, TxProcessResult>();
-    let duplicates = 0;
+      const results: TxProcessResult[] = [];
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>();
+      let duplicates = 0;
 
-    for (const txHash of tx_hashes) {
-      const normalized = normalizeTransactionHash(txHash);
-      const existing = resultsByNormalizedHash.get(normalized);
+      for (const txHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(txHash);
+        const existing = resultsByNormalizedHash.get(normalized);
 
-      if (existing) {
-        duplicates++;
-        results.push(existing);
-        continue;
+        if (existing) {
+          duplicates++;
+          results.push(existing);
+          continue;
+        }
+
+        try {
+          const result = await processTxReceipt(txHash);
+          resultsByNormalizedHash.set(normalized, result);
+          results.push(result);
+        } catch (e: any) {
+          const errorResult: TxProcessResult = {
+            txHash,
+            status: "error",
+            eventsProcessed: 0,
+            eventLabels: [],
+            error: e?.message ?? String(e),
+          };
+          resultsByNormalizedHash.set(normalized, errorResult);
+          results.push(errorResult);
+        }
       }
 
-      try {
-        const result = await processTxReceipt(txHash);
-        resultsByNormalizedHash.set(normalized, result);
-        results.push(result);
-      } catch (e: any) {
-        // Per-tx errors are captured so they don't abort the rest of the batch
-        const errorResult: TxProcessResult = {
-          txHash,
-          status: "error",
-          eventsProcessed: 0,
-          eventLabels: [],
-          error: e?.message ?? String(e),
-        };
-        resultsByNormalizedHash.set(normalized, errorResult);
-        results.push(errorResult);
-      }
-
-      const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      const uniqueResults = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
       res.json({
         summary: {
           total: results.length,
-          processed: results.filter((r) => r.status === "processed").length,
-          noEvents: results.filter((r) => r.status === "no_events").length,
-          notFound: results.filter((r) => r.status === "not_found").length,
-          errors: results.filter((r) => r.status === "error").length,
+          processed: uniqueResults.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResults.filter((r) => r.status === "not_found").length,
+          errors: uniqueResults.filter((r) => r.status === "error").length,
+          duplicates,
           totalEventsProcessed: totalProcessed,
         },
         results,
@@ -652,28 +654,4 @@ eventsRouter.post(
     } catch (e) {
       next(e);
     }
-
-    // Stats are derived from the unique (deduplicated) results so a hash that
-    // was submitted more than once contributes to the summary exactly once –
-    // otherwise repeated deliveries of the same tx within a batch would look
-    // like independent units of work. `duplicates` accounts for the rest of
-    // `total`: total === processed + noEvents + notFound + errors + duplicates.
-    const uniqueResults = Array.from(resultsByNormalizedHash.values());
-    const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
-
-    res.json({
-      summary: {
-        total: results.length,
-        processed: uniqueResults.filter((r) => r.status === "processed").length,
-        noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-        notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-        errors: uniqueResults.filter((r) => r.status === "error").length,
-        duplicates,
-        totalEventsProcessed: totalProcessed,
-      },
-      results,
-    });
-  } catch (e) {
-    next(e);
-  }
 });
