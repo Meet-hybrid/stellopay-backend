@@ -99,10 +99,11 @@ beforeEach(() => {
 
 describe("analytics route", () => {
   it("validates and normalizes the address and returns twelve months of chart data", async () => {
-    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
+    const address = normalizeStarknetAddress("abc");
+    queryState.rows.payments = [{ month: 3, amount: "1000000", to: address }];
     queryState.rows.escrowEvents = [
-      { month: 4, amount: "2000000", eventType: "Funded" },
-      { month: 5, amount: "3000000", eventType: "Released" },
+      { month: 4, amount: "2000000", eventType: "Funded", employer: address },
+      { month: 5, amount: "3000000", eventType: "Released", to: address },
     ];
     queryState.rows.agreementEvents = [{ month: 6, agreementId: "1" }];
 
@@ -139,6 +140,55 @@ describe("analytics route", () => {
     const res = await request(makeApp()).get("/api/v1/analytics/not-an-address").expect(400);
     expect(res.body.error).toBe("Validation failed");
     expect(queryState.eqValues).toHaveLength(0);
+  });
+
+  it("computes net payments correctly and ignores agreements when financial activity exists", async () => {
+    const address = normalizeStarknetAddress("abc");
+    // month 1: received 5, sent 2 (net 3)
+    queryState.rows.payments = [
+      { month: 1, amount: "5000000", to: address, from: "someone" },
+      { month: 1, amount: "2000000", from: address, to: "someone" },
+    ];
+    // month 2: funded 4 (net -4), released 3 (net +3), refunded 1 (net +1)
+    queryState.rows.escrowEvents = [
+      { month: 2, amount: "4000000", eventType: "Funded", employer: address, to: "someone" },
+      { month: 2, amount: "3000000", eventType: "Released", employer: "someone", to: address },
+      { month: 2, amount: "1000000", eventType: "Refunded", employer: address, to: "someone" },
+    ];
+    // month 3: 2 agreements, but should be ignored because there is financial activity
+    queryState.rows.agreementEvents = [
+      { month: 3, agreementId: "1" },
+      { month: 3, agreementId: "2" },
+    ];
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+    
+    // month 1 should be 3.0
+    expect(res.body.data[0].views).toBe(3);
+    // month 2 should be -4 + 3 + 1 = 0
+    expect(res.body.data[1].views).toBe(0);
+    // month 3 should be 0 because agreement fallback is suppressed
+    expect(res.body.data[2].views).toBe(0);
+    // Total should be 3
+    expect(res.body.total).toBe(3);
+  });
+
+  it("falls back to agreement counts when there is no financial activity", async () => {
+    queryState.rows.payments = [];
+    queryState.rows.escrowEvents = [];
+    queryState.rows.agreementEvents = [
+      { month: 1, agreementId: "1" },
+      { month: 1, agreementId: "2" },
+      { month: 2, agreementId: "3" },
+    ];
+
+    const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+    
+    // month 1: 2 agreements * 1000 base units = 0.002
+    expect(res.body.data[0].views).toBe(0.002);
+    // month 2: 1 agreement * 1000 base units = 0.001
+    expect(res.body.data[1].views).toBe(0.001);
+    expect(res.body.total).toBe(0.003);
   });
 
   it("rejects a year below the supported range with 400", async () => {

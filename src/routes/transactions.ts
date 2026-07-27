@@ -81,27 +81,31 @@ interface TransactionFilters {
 
 export const transactionsRouter = Router();
 
-export interface TransactionRecord {
-  id: string;
-  type: string;
-  address: string;
-  date: string;
-  time: string;
-  token: string;
-  amount: string;
-  status: "Completed";
-  tokenIcon: string;
-  txHash: string;
-  createdAt: Date;
-}
+export const TransactionRecordSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  address: z.string(),
+  date: z.string(),
+  time: z.string(),
+  token: z.string(),
+  amount: z.string(),
+  status: z.literal("Completed"),
+  tokenIcon: z.string(),
+  txHash: z.string(),
+  createdAt: z.date(),
+});
 
-export interface TransactionExport {
-  transactions: TransactionRecord[];
-  total: number;
-  hasMore: boolean;
-  limit: number;
-  offset: number;
-}
+export type TransactionRecord = z.infer<typeof TransactionRecordSchema>;
+
+export const TransactionExportSchema = z.object({
+  transactions: z.array(TransactionRecordSchema),
+  total: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+});
+
+export type TransactionExport = z.infer<typeof TransactionExportSchema>;
 /**
  * Explicit allowlist of every event-type value that may appear in the
  * `eventTypes` query parameter. Values outside this set are rejected before
