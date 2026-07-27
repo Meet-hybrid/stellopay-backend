@@ -427,6 +427,61 @@ function parsePagination(req: { query: Record<string, unknown> }): { limit: numb
 }
 
 /**
+ * Explicit allowlist of sort columns clients may request.
+ *
+ * Only these values are permitted for `sortBy`; anything else is rejected with
+ * a 400 before it can reach any SQL construction, preventing column-injection.
+ *
+ * - `"date"` maps to the `createdAt` timestamp on every merged `TransactionItem`.
+ * - `"amount"` maps to the numeric value encoded in the human-readable `amount`
+ *   string (raw amounts are not stored in `TransactionItem`, so we parse the
+ *   numeric prefix from the formatted string for comparison).
+ */
+const ALLOWED_SORT_COLUMNS = new Set(["date", "amount"] as const);
+export type SortColumn = "date" | "amount";
+export type SortDir = "asc" | "desc";
+
+/**
+ * Parses `sortBy` and `sortDir` query parameters.
+ *
+ * - `sortBy` must be one of the values in `ALLOWED_SORT_COLUMNS`; any other
+ *   value causes this function to return `{ error: "..." }` so the caller can
+ *   respond with 400 immediately — the value is **never** interpolated into SQL.
+ * - `sortDir` must be `"asc"` or `"desc"` (case-insensitive). Invalid values
+ *   default to `"desc"` rather than returning an error, which matches common
+ *   API conventions.
+ * - Omitting `sortBy` returns `{ sortBy: null, sortDir: "desc" }` so callers
+ *   can preserve the existing default ordering.
+ *
+ * @returns `{ sortBy, sortDir }` on success, or `{ error }` when `sortBy` is
+ *   present but not in the allowlist.
+ */
+function parseSortParams(req: { query: Record<string, unknown> }):
+  | { sortBy: SortColumn | null; sortDir: SortDir; error?: never }
+  | { error: string; sortBy?: never; sortDir?: never } {
+  const rawSortBy = req.query.sortBy as string | undefined;
+  const rawSortDir = (req.query.sortDir as string | undefined)
+    ?.toLowerCase();
+
+  const sortDir: SortDir =
+    rawSortDir === "asc" || rawSortDir === "desc" ? rawSortDir : "desc";
+
+  if (!rawSortBy) {
+    return { sortBy: null, sortDir };
+  }
+
+  if (!ALLOWED_SORT_COLUMNS.has(rawSortBy as SortColumn)) {
+    return {
+      error: `Invalid sortBy value "${rawSortBy}". Allowed values: ${
+        [...ALLOWED_SORT_COLUMNS].join(", ")
+      }.`,
+    };
+  }
+
+  return { sortBy: rawSortBy as SortColumn, sortDir };
+}
+
+/**
  * Parses a comma-separated `eventTypes` query parameter into a string array.
  *
  * - Returns `null` when the parameter is absent, empty, or whitespace-only.
@@ -924,10 +979,69 @@ async function fetchAndBuildTransactions(
   return { allTransactions, total };
 }
 
+// ── Sort helper ──────────────────────────────────────────────────────────
+
+/**
+ * Extracts a raw numeric value from a formatted amount string for sorting.
+ *
+ * Handles the following formatted patterns produced by `formatAmount`:
+ * - STRK amounts: `"+1.234567 STRK"`, `"-0.500000 STRK"`
+ * - USD amounts:  `"+$1.23"`, `"-$0.00"`
+ * - Placeholder:  `"-"` → returns `0`
+ *
+ * The sign (`+`/`-`) prefix and non-numeric characters (`$`, ` STRK`) are
+ * stripped before parsing so that the raw magnitude is used for ordering;
+ * the sign is preserved so that negative amounts sort below positives.
+ */
+function parseAmountForSort(amount: string): number {
+  if (!amount || amount === "-") return 0;
+  // Remove currency symbols, token names, and whitespace; keep sign, digits, dot.
+  const stripped = amount.replace(/[^\d.+\-]/g, "").replace(/\s+/g, "");
+  const parsed = parseFloat(stripped);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Applies client-requested sort to the merged transaction array.
+ *
+ * - `sortBy === "date"` sorts by `createdAt` (newest first for `desc`,
+ *   oldest first for `asc`).
+ * - `sortBy === "amount"` sorts by the numeric value parsed from the
+ *   formatted `amount` field.
+ * - `sortBy === null` preserves the existing default sort (date desc +
+ *   txHash tiebreak) which is already applied inside
+ *   `fetchAndBuildTransactions`.
+ *
+ * A secondary `txHash` tiebreak is always applied for stable ordering.
+ */
+function applySort(
+  transactions: TransactionItem[],
+  sortBy: SortColumn | null,
+  sortDir: SortDir,
+): TransactionItem[] {
+  if (!sortBy) return transactions; // preserve default sort
+
+  const dir = sortDir === "asc" ? 1 : -1;
+
+  return [...transactions].sort((a, b) => {
+    let cmp = 0;
+    if (sortBy === "date") {
+      const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      cmp = tA - tB;
+    } else if (sortBy === "amount") {
+      cmp = parseAmountForSort(a.amount) - parseAmountForSort(b.amount);
+    }
+    if (cmp !== 0) return cmp * dir;
+    // Stable tiebreak by txHash (always ascending)
+    return a.txHash.localeCompare(b.txHash);
+  });
+}
+
 // ── Response helper ──────────────────────────────────────────────────────
 
 /**
- * Slices, paginates, and sends the unified transaction list.
+ * Sorts (if requested), slices, paginates, and sends the unified transaction list.
  *
  * The response body always contains:
  * - `transactions`: the page of items (`array`, may be empty)
@@ -941,8 +1055,11 @@ function respondPaginated(
   total: number,
   limit: number,
   offset: number,
+  sortBy: SortColumn | null = null,
+  sortDir: SortDir = "desc",
 ): void {
-  const paginated = allTransactions.slice(offset, offset + limit);
+  const sorted = applySort(allTransactions, sortBy, sortDir);
+  const paginated = sorted.slice(offset, offset + limit);
   const hasMore = total > offset + limit;
   const body: TransactionResponse = {
     transactions: paginated,
@@ -958,6 +1075,7 @@ function respondPaginated(
 //
 // Contract:
 // - Accepts `eventTypes` query filter (comma-separated).
+// - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Deduplicates agreement events by id.
 // - Employee condition mode: "employer-or-employee".
 // - Does NOT support date-range filtering.
@@ -970,6 +1088,14 @@ transactionsRouter.get(
       const { limit, offset } = parsePagination(req);
       const eventTypes = parseEventTypes(req);
 
+      // Validate and parse sort parameters against the allowlist.
+      const sortResult = parseSortParams(req);
+      if (sortResult.error) {
+        res.status(400).json({ error: sortResult.error });
+        return;
+      }
+      const { sortBy, sortDir } = sortResult;
+
       const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined });
       const { allTransactions, total } = await fetchAndBuildTransactions(
         userAddress,
@@ -978,7 +1104,7 @@ transactionsRouter.get(
         { deduplicateAgreementEvents: true },
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset);
+      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e) {
       next(e);
     }
@@ -989,6 +1115,7 @@ transactionsRouter.get(
 //
 // Contract:
 // - Accepts `startDate` / `endDate` query filters.
+// - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Employee condition mode: "employee-only".
 // - Does NOT deduplicate agreement events.
 // - Does NOT support `eventTypes` filter.
@@ -1001,6 +1128,14 @@ transactionsRouter.get(
       const { limit, offset } = parsePagination(req);
       const { startDate, endDate } = parseDateFilters(req);
 
+      // Validate and parse sort parameters against the allowlist.
+      const sortResult = parseSortParams(req);
+      if (sortResult.error) {
+        res.status(400).json({ error: sortResult.error });
+        return;
+      }
+      const { sortBy, sortDir } = sortResult;
+
       const conds = buildConditions(
         userAddress,
         { startDate, endDate },
@@ -1012,7 +1147,7 @@ transactionsRouter.get(
         offset + limit,
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset);
+      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e) {
       next(e);
     }
