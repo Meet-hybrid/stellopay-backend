@@ -12,6 +12,13 @@
  * All routes are gated behind the BILLING_ENABLED feature flag.
  * When the flag is false every endpoint returns HTTP 501 with a clear message.
  *
+ * All routes require a valid session (see src/auth/middleware.ts).
+ * Every route verifies that the calling wallet address matches the
+ * billing profile's ownerAddress before returning any data. A 404 is
+ * always returned when the profile does not exist OR the caller is not
+ * the owner — the two cases are intentionally indistinguishable to the
+ * caller so attackers cannot enumerate billing profile IDs.
+ *
  * All responses follow the envelope:  { success: boolean, data?: T, error?: string }
  *
  * NOTE: Sensitive fields (taxId, dateOfBirth) are omitted from all API responses.
@@ -24,8 +31,27 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
+import { requireAuth } from "../auth/middleware.js";
 
 export const billingRouter = express.Router();
+
+// ---------------------------------------------------------------------------
+// Safe financial math
+// ---------------------------------------------------------------------------
+
+/**
+ * Safely parses a Postgres numeric(18,6) value (returned as a string by
+ * Drizzle) into a JavaScript number.  Returns 0 instead of NaN / Infinity
+ * when the input is missing, malformed, or negative.  Every arithmetic
+ * result is rounded to 6 decimal places to stay lossless within the
+ * column's declared scale.
+ */
+function parseSafeAmount(value: unknown): number {
+  if (typeof value !== "string" || value.trim() === "") return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n * 1e6) / 1e6;
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -39,6 +65,148 @@ function ok<T>(res: Response, data: T, status = 200): void {
 /** Uniform error envelope */
 function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
+}
+
+const BILLING_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+type BillingIdempotencyEntry = {
+  createdAt: number;
+  expiresAt: number;
+  bodyFingerprint: string;
+  statusCode: number;
+  responseBody: unknown;
+};
+
+// NOTE: Billing idempotency is currently backed by an in-process TTL cache.
+// If this service is scaled horizontally, this should be moved to a shared store.
+const billingIdempotencyStore = new Map<string, BillingIdempotencyEntry>();
+
+function stableSerialize(value: unknown): string {
+  if (typeof value === "undefined") return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`).join(",")}}`;
+  }
+  return String(value);
+}
+
+function getHeader(req: Request, name: string): string | undefined {
+  const value = req.get(name);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function resolveBillingAccountScope(req: Request): string {
+  for (const headerName of ["x-user-address", "x-account-id", "x-user-id"]) {
+    const value = getHeader(req, headerName);
+    if (value) return value;
+  }
+  return req.ip ?? "anonymous";
+}
+
+function getBillingIdempotencyCacheKey(req: Request, idempotencyKey: string): string {
+  const accountScope = resolveBillingAccountScope(req);
+  const routeKey = req.originalUrl || req.path || "/";
+  const profileId = typeof req.params?.profileId === "string" ? req.params.profileId : "";
+  return `billing:${accountScope}:${req.method}:${routeKey}:${profileId}:${idempotencyKey}`;
+}
+
+function pruneExpiredEntries(now = Date.now()): void {
+  for (const [cacheKey, entry] of billingIdempotencyStore.entries()) {
+    if (entry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+  }
+}
+
+export function clearBillingIdempotencyStore(): void {
+  billingIdempotencyStore.clear();
+}
+
+/**
+ * Wrap a mutating billing handler with idempotency support.
+ *
+ * When an Idempotency-Key header is present, the first successful response for
+ * that account/route/body combination is cached for 24 hours. Replays with the
+ * same key and body return the cached response; replays with the same key but a
+ * different body are rejected with 409 Conflict.
+ */
+export function withBillingIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey = getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const method = req.method.toUpperCase();
+
+    if (!idempotencyKey || ["GET", "HEAD", "OPTIONS"].includes(method)) {
+      await handler(req, res, next);
+      return;
+    }
+
+    const now = Date.now();
+    pruneExpiredEntries(now);
+
+    const cacheKey = getBillingIdempotencyCacheKey(req, idempotencyKey);
+    const existingEntry = billingIdempotencyStore.get(cacheKey);
+
+    if (existingEntry && existingEntry.expiresAt > now) {
+      if (existingEntry.bodyFingerprint !== stableSerialize(req.body)) {
+        fail(res, 409, "Idempotency key already used with a different request body");
+        return;
+      }
+
+      res.status(existingEntry.statusCode).json(existingEntry.responseBody);
+      return;
+    }
+
+    if (existingEntry && existingEntry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    let cachedResponse: BillingIdempotencyEntry | undefined;
+
+    const persistResponse = (body: unknown): void => {
+      if (cachedResponse) {
+        return;
+      }
+      cachedResponse = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + BILLING_IDEMPOTENCY_TTL_MS,
+        bodyFingerprint: stableSerialize(req.body),
+        statusCode: res.statusCode,
+        responseBody: body,
+      };
+      billingIdempotencyStore.set(cacheKey, cachedResponse);
+    };
+
+    res.json = ((body: unknown) => {
+      persistResponse(body);
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.send = ((body: unknown) => {
+      if (!cachedResponse) {
+        persistResponse(body);
+      }
+      return originalSend(body);
+    }) as typeof res.send;
+
+    try {
+      await handler(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
 }
 
 /** Zod schema for the :profileId path param – non-empty string, max 128 chars */
@@ -74,8 +242,50 @@ function requireBillingEnabled(_req: Request, res: Response, next: NextFunction)
   next();
 }
 
-// Apply the feature-flag gate to every route in this router
-billingRouter.use("/billing", requireBillingEnabled);
+/** Middleware: verify the caller owns the billing profile identified by :profileId */
+async function requireBillingOwner(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const profileId: string = res.locals.profileId;
+  const callerAddress = req.auth!.address;
+
+  try {
+    const [row] = await db
+      .select({ ownerAddress: schema.billingProfiles.ownerAddress })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.id, profileId))
+      .limit(1);
+
+    if (!row || row.ownerAddress !== callerAddress) {
+      fail(res, 404, `Billing profile '${profileId}' not found`);
+      return;
+    }
+
+    next();
+  } catch (err: any) {
+    console.error("[billing] Error in ownership check:", err);
+    fail(res, 500, "Failed to verify billing profile ownership");
+  }
+}
+
+// Apply the feature-flag gate, authentication, and ownership check to every
+// billing route.  validateProfileId must run first so res.locals.profileId is
+// available for the ownership lookup.
+billingRouter.use("/billing", requireBillingEnabled, requireAuth);
+
+// Mutating billing routes can opt into request replay protection via Idempotency-Key.
+billingRouter.use("/billing", (req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method.toUpperCase())) {
+    next();
+    return;
+  }
+
+  withBillingIdempotency(async (_req, _res, _next) => {
+    next();
+  })(req, res, next);
+});
 
 // ---------------------------------------------------------------------------
 // Strip sensitive fields before returning a profile row to the client.
@@ -103,6 +313,7 @@ function stripSensitive(profile: ProfileRow): SafeProfile {
 billingRouter.get(
   "/billing/profiles/:profileId",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -113,6 +324,9 @@ billingRouter.get(
         .where(eq(schema.billingProfiles.id, profileId))
         .limit(1);
 
+      // Ownership already verified by requireBillingOwner; this is a
+      // safety net for a very unlikely TOCTOU race (profile deleted
+      // between middleware and handler).
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
         return;
@@ -150,6 +364,7 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/general-information",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -190,22 +405,11 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/payment-methods",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
     try {
-      // Verify the profile exists first to give a meaningful 404
-      const [profile] = await db
-        .select({ id: schema.billingProfiles.id })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
       const paymentMethods = await db
         .select()
         .from(schema.billingPaymentMethods)
@@ -227,21 +431,11 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select({ id: schema.billingProfiles.id })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
       const invoices = await db
         .select()
         .from(schema.billingInvoices)
@@ -263,6 +457,7 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/summary",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -284,8 +479,12 @@ billingRouter.get(
         return;
       }
 
-      const limit = parseFloat(profile.annualRewardLimit ?? "0");
-      const used = parseFloat(profile.usedAmount ?? "0");
+      // Use safe parsing to avoid NaN / Infinity from malformed or
+      // excessively large numeric strings.
+      const limit = parseSafeAmount(profile.annualRewardLimit);
+      const used = parseSafeAmount(profile.usedAmount);
+      // Clamp remaining to a minimum of 0 to avoid negative values
+      // when usedAmount has overrun the limit in the database.
       const remaining = Math.max(0, limit - used);
       const progressPct = limit > 0 ? (used / limit) * 100 : 0;
 
