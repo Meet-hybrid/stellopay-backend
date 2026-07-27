@@ -13,6 +13,16 @@ const EnvSchema = z.object({
   // Observability configuration
   LOG_LEVEL: z.string().optional().default("info"),
   LOG_FORMAT: z.string().optional().default("json"),
+  LOG_REDACT_QUERY_PARAMS: z
+    .string()
+    .optional()
+    .default("token,signature,secret")
+    .transform((s) =>
+      s
+        .split(",")
+        .map((a) => a.trim().toLowerCase())
+        .filter((a) => a.length > 0),
+    ),
 
   // Required: Starknet RPC URL(s), v0_8 — comma-separated for failover (HTTPS only)
   // Provide via environment variable (e.g. in `.env` or inline `STARKNET_RPC_URL=... pnpm dev`)
