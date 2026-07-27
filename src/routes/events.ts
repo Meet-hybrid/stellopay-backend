@@ -509,8 +509,227 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
 }
 
 // ---------------------------------------------------------------------------
+// Cursor-based pagination for event listing
+// ---------------------------------------------------------------------------
+
+/**
+ * The decoded form of a pagination cursor. All three fields together form a
+ * total order over `agreement_events` rows that is stable even when new rows
+ * are inserted mid-pagination: `(blockNumber, eventIndex, id)` is strictly
+ * monotone per insert and the `id` (txHash_eventIndex composite) breaks any
+ * remaining ties.
+ *
+ * @internal — callers only see the opaque base64url string.
+ */
+export interface EventCursorPayload {
+  blockNumber: number;
+  eventIndex: number;
+  id: string;
+}
+
+/**
+ * Encodes a cursor payload to an opaque base64url string that is safe to
+ * include in a URL query parameter without percent-encoding.
+ *
+ * The encoding is intentionally simple (JSON → base64url) so it is easy to
+ * audit and decode in tests, but it is not "guessable" as an incrementable
+ * integer — clients cannot derive internal row IDs from it without already
+ * knowing the `id` value (txHash_eventIndex).
+ */
+export function encodeCursor(payload: EventCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload)).toString("base64url");
+}
+
+/**
+ * Decodes a cursor string produced by {@link encodeCursor}. Returns `null` on
+ * any parse or validation failure so callers can treat a bad cursor as
+ * "no cursor" (first page) rather than throwing a 500.
+ */
+export function decodeCursor(cursor: string): EventCursorPayload | null {
+  try {
+    const raw = Buffer.from(cursor, "base64url").toString("utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      typeof (parsed as any).blockNumber !== "number" ||
+      typeof (parsed as any).eventIndex !== "number" ||
+      typeof (parsed as any).id !== "string" ||
+      (parsed as any).id.length === 0
+    ) {
+      return null;
+    }
+    return parsed as EventCursorPayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zod schema for the `GET /events/list` query parameters.
+ *
+ * - `cursor`       — opaque pagination token from a previous response; absent
+ *   on the first page.
+ * - `limit`        — page size, clamped to `[1, MAX_PAGE_LIMIT]`; defaults to
+ *   `DEFAULT_PAGE_LIMIT`.
+ * - `agreement_id` — optional filter: only return events for this agreement.
+ * - `event_type`   — optional filter: only return events of this type.
+ */
+const EventListQuerySchema = z.object({
+  // An absent or empty cursor string both mean "first page".
+  cursor: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.length > 0 ? v : undefined)),
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => {
+      const n = v === undefined ? DEFAULT_PAGE_LIMIT : parseInt(v, 10);
+      if (!Number.isFinite(n) || Number.isNaN(n)) return DEFAULT_PAGE_LIMIT;
+      return Math.min(Math.max(n, 1), MAX_PAGE_LIMIT);
+    }),
+  agreement_id: z.string().min(1).optional(),
+  event_type: z.string().min(1).optional(),
+});
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+/**
+ * GET /events/list
+ *
+ * Returns a stable, cursor-paginated page of agreement events ordered by
+ * `(blockNumber ASC, eventIndex ASC, id ASC)`. This ordering is insertion-
+ * stable: new events inserted after a client starts paginating never cause a
+ * row to appear on two pages or to be skipped.
+ *
+ * **Query parameters**
+ *
+ * | Param          | Default              | Notes                              |
+ * |----------------|----------------------|------------------------------------|
+ * | `cursor`       | _(first page)_       | Opaque token from `nextCursor`     |
+ * | `limit`        | `DEFAULT_PAGE_LIMIT` | Clamped to `[1, MAX_PAGE_LIMIT]`   |
+ * | `agreement_id` | _(all agreements)_   | Filter by agreement                |
+ * | `event_type`   | _(all types)_        | Filter by event type               |
+ *
+ * **Response**
+ * ```json
+ * {
+ *   "events":     [...],
+ *   "nextCursor": "base64url-string | null",
+ *   "hasMore":    true | false,
+ *   "count":      number
+ * }
+ * ```
+ *
+ * `nextCursor` is `null` on the last page. Pass it as `?cursor=` on the next
+ * request to retrieve the following page. The cursor is an opaque base64url
+ * string — do not parse or construct it; its internal format may change.
+ *
+ * **Security**
+ * Cursors encode `(blockNumber, eventIndex, id)` where `id` is the composite
+ * `txHash_eventIndex` primary key. A client cannot infer an internal sequence
+ * from the cursor without already knowing the `id` value. The endpoint is
+ * public (read-only, indexed on-chain data) consistent with the existing
+ * indexed reading routes.
+ */
+eventsRouter.get("/events/list", async (req, res, next) => {
+  try {
+    const query = EventListQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      res.status(400).json({
+        error: "Invalid query parameters",
+        details: query.error.issues,
+      });
+      return;
+    }
+
+    const { cursor, limit, agreement_id, event_type } = query.data;
+
+    // Decode cursor — invalid cursors restart from page 1 (fail-open on client
+    // errors; the response is always a valid first page rather than a 400).
+    const cursorPayload = cursor ? decodeCursor(cursor) : null;
+
+    // Build WHERE conditions
+    const conditions = [];
+
+    if (agreement_id) {
+      conditions.push(eq(schema.agreementEvents.agreementId, agreement_id));
+    }
+    if (event_type) {
+      conditions.push(eq(schema.agreementEvents.eventType, event_type));
+    }
+
+    // Cursor condition: fetch rows strictly after the cursor position using a
+    // tuple comparison on (blockNumber, eventIndex, id). This is the standard
+    // "keyset pagination" pattern — it is index-friendly and stable across
+    // concurrent inserts.
+    //
+    // The SQL equivalent is:
+    //   (block_number, event_index, id) > (?, ?, ?)
+    //
+    // We express it with an explicit OR expansion so Drizzle does not need to
+    // support tuple literals:
+    //   block_number > cursorBlock
+    //   OR (block_number = cursorBlock AND event_index > cursorEventIndex)
+    //   OR (block_number = cursorBlock AND event_index = cursorEventIndex AND id > cursorId)
+    if (cursorPayload) {
+      const { blockNumber: cb, eventIndex: ci, id: cid } = cursorPayload;
+      conditions.push(
+        or(
+          gt(schema.agreementEvents.blockNumber, cb),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            gt(schema.agreementEvents.eventIndex, ci),
+          ),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            sql`${schema.agreementEvents.eventIndex} = ${ci}`,
+            gt(schema.agreementEvents.id, cid),
+          ),
+        ),
+      );
+    }
+
+    // Fetch limit + 1 so we can detect whether there is a next page without a
+    // separate COUNT query.
+    const rows = await db
+      .select()
+      .from(schema.agreementEvents)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(
+        schema.agreementEvents.blockNumber,
+        schema.agreementEvents.eventIndex,
+        schema.agreementEvents.id,
+      )
+      .limit(limit + 1);
+
+    const hasMore = rows.length > limit;
+    const events = hasMore ? rows.slice(0, limit) : rows;
+
+    // Build the next cursor from the last row on this page.
+    let nextCursor: string | null = null;
+    if (hasMore && events.length > 0) {
+      const last = events[events.length - 1];
+      nextCursor = encodeCursor({
+        blockNumber: last.blockNumber,
+        eventIndex: last.eventIndex,
+        id: last.id,
+      });
+    }
+
+    res.json({
+      events,
+      nextCursor,
+      hasMore,
+      count: events.length,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
 
 /**
  * POST /events/process_tx/:tx_hash

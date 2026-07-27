@@ -189,11 +189,35 @@ function coerceNullOrEmptyToUndefined(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Parses and clamps pagination query parameters. Clamping happens server-side
+ * so a client cannot request an unbounded, zero, or negative page: `limit` is
+ * forced into `[1, MAX_PAGE_LIMIT]` and `offset` to `>= 0`. Missing or
+ * non-numeric values fall back to safe defaults rather than failing the
+ * request.
+ *
+ * This function **never throws** — any input shape returns a valid, finite
+ * pair. Non-object inputs (strings, numbers, arrays, `null`, `undefined`) are
+ * treated as if no pagination params were supplied and fall back to defaults.
+ *
+ * @param query - The request query object (`req.query`), or any value.
+ * @returns `{ limit, offset }` — both finite integers within the documented
+ *   bounds.
+ *
+ * @example
+ * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
+ * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
+ * parsePagination("not-an-object");   // { limit: 50, offset: 0 }
+ */
 export function parsePagination(query: unknown): {
   limit: number;
   offset: number;
 } {
-  const source = (query ?? {}) as Record<string, unknown>;
+  // Non-object inputs (strings, numbers, arrays, null, undefined) carry no
+  // limit/offset keys. Treat them as an empty object so the defaults engage
+  // rather than relying on a silent `as Record<string, unknown>` cast.
+  const source: Record<string, unknown> = isPlainObject(query) ? query : {};
+
   const limitRaw = z.coerce
     .number()
     .int()
