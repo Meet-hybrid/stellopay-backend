@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq } from "drizzle-orm";
+import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
@@ -11,6 +11,7 @@ import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
+import { parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
 
@@ -654,4 +655,162 @@ eventsRouter.post(
     } catch (e) {
       next(e);
     }
+  },
+);
+
+/**
+ * Parse an `eventType` query parameter into a clean array of event type strings.
+ * Supports single strings ("AgreementCreated"), comma-separated values
+ * ("AgreementCreated,PaymentSent"), or multiple query parameters (`?eventType=A&eventType=B`).
+ */
+export function parseEventTypeQuery(raw: unknown): string[] {
+  if (raw === undefined || raw === null || raw === "") return [];
+  const items = Array.isArray(raw) ? raw : [raw];
+  const result: string[] = [];
+  for (const item of items) {
+    if (typeof item === "string") {
+      const parts = item.split(",").map((s) => s.trim()).filter(Boolean);
+      result.push(...parts);
+    }
+  }
+  return Array.from(new Set(result));
+}
+
+/**
+ * Parse a `from` or `to` timestamp query parameter into a valid JavaScript `Date` object.
+ * Accepts ISO 8601 strings or numeric timestamp strings.
+ *
+ * @throws {z.ZodError} If the timestamp format is malformed or invalid.
+ */
+export function parseTimestampQuery(raw: unknown, paramName: string): Date | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+
+  let date: Date;
+  if (typeof raw === "number") {
+    date = new Date(raw);
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+
+    if (/^\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
+      date = new Date(num < 10000000000 ? num * 1000 : num);
+    } else {
+      date = new Date(trimmed);
+    }
+  } else {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: [paramName],
+        message: `Invalid timestamp format for parameter '${paramName}'`,
+      },
+    ]);
+  }
+
+  if (isNaN(date.getTime())) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: [paramName],
+        message: `Invalid timestamp format for parameter '${paramName}'`,
+      },
+    ]);
+  }
+
+  return date;
+}
+
+/**
+ * Validates that `from` timestamp is less than or equal to `to` timestamp.
+ *
+ * @throws {z.ZodError} If `from` is strictly after `to`.
+ */
+export function validateTimeRange(from?: Date, to?: Date): void {
+  if (from && to && from.getTime() > to.getTime()) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ["from"],
+        message: "from timestamp must be less than or equal to to timestamp",
+      },
+    ]);
+  }
+}
+
+/**
+ * GET /events
+ *
+ * Fetch indexed agreement events with optional filtering by event type, time range,
+ * agreement ID, or contract address, pushed down into database queries with pagination.
+ *
+ * Query parameters:
+ * - `eventType`: single string, comma-separated string, or repeated parameter
+ * - `from`: ISO 8601 or numeric timestamp for start bound (inclusive: createdAt >= from)
+ * - `to`: ISO 8601 or numeric timestamp for end bound (inclusive: createdAt <= to)
+ * - `agreement_id` / `agreementId`: optional filter by agreement ID
+ * - `contract_address` / `contractAddress`: optional filter by contract address
+ * - `limit`, `offset`: standard pagination parameters (via parsePagination)
+ */
+eventsRouter.get("/events", async (req, res, next) => {
+  try {
+    const eventTypes = parseEventTypeQuery(req.query.eventType);
+    const fromDate = parseTimestampQuery(req.query.from, "from");
+    const toDate = parseTimestampQuery(req.query.to, "to");
+    validateTimeRange(fromDate, toDate);
+
+    const { limit, offset } = parsePagination(req.query);
+
+    const rawAgreementId = req.query.agreement_id ?? req.query.agreementId;
+    const agreementId = rawAgreementId ? String(rawAgreementId).trim() : undefined;
+
+    const rawContractAddr = req.query.contract_address ?? req.query.contractAddress;
+    const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
+
+    const conditions: SQL[] = [];
+
+    if (eventTypes.length > 0) {
+      conditions.push(inArray(schema.agreementEvents.eventType, eventTypes));
+    }
+    if (fromDate) {
+      conditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+    }
+    if (toDate) {
+      conditions.push(lte(schema.agreementEvents.createdAt, toDate));
+    }
+    if (agreementId) {
+      conditions.push(eq(schema.agreementEvents.agreementId, agreementId));
+    }
+    if (contractAddress) {
+      conditions.push(eq(schema.agreementEvents.contractAddress, contractAddress));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const events = await db
+      .select()
+      .from(schema.agreementEvents)
+      .where(whereClause)
+      .orderBy(desc(schema.agreementEvents.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    res.json({
+      events,
+      count: events.length,
+      limit,
+      offset,
+    });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      res.status(400).json({
+        error: "Validation failed",
+        details: e.issues,
+      });
+      return;
+    }
+    next(e);
+  }
 });
+
