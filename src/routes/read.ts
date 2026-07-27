@@ -29,10 +29,8 @@ function logReadTelemetry(entry: TelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
       console.error(JSON.stringify(logEntry));
     } else {
-      // eslint-disable-next-line no-console
       console.info(JSON.stringify(logEntry));
     }
   } else {
@@ -42,10 +40,8 @@ function logReadTelemetry(entry: TelemetryEntry) {
       logEntry.request_id ? ` [${logEntry.request_id}]` : ""
     }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
       console.error(msg);
     } else {
-      // eslint-disable-next-line no-console
       console.info(msg);
     }
   }
@@ -95,51 +91,6 @@ async function erc20BalanceOf(token: string, owner: string) {
     throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
   }
   return u256ToString(u256);
-}
-
-async function erc20Decimals(token: string) {
-  const result = await callContractResult(token, "decimals", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected decimals result: ${JSON.stringify(result)}`);
-  }
-  return Number(BigInt(result[0]));
-}
-
-async function erc20Symbol(token: string) {
-  const result = await callContractResult(token, "symbol", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected symbol result: ${JSON.stringify(result)}`);
-  }
-  try {
-    const result = await callContractResult(token, "balance_of", [owner]);
-    const u256 = asU256FromResult(result);
-    if (!u256) {
-      throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
-    }
-    const balance = u256ToString(u256);
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logReadTelemetry({
-      operation: "erc20_balance_of",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      token,
-      owner,
-      request_id: requestId,
-    });
-    return balance;
-  } catch (err: any) {
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logReadTelemetry({
-      operation: "erc20_balance_of",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "error",
-      token,
-      owner,
-      request_id: requestId,
-      error: err?.message || String(err),
-    });
-    throw err;
-  }
 }
 
 async function erc20Decimals(token: string, requestId?: string) {
@@ -216,7 +167,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
   try {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
-    const balance = await erc20BalanceOf(token, owner, res.locals.requestId);
+    const balance = await erc20BalanceOf(token, owner);
     res.json({ token, owner, balance });
   } catch (e) {
     next(e);

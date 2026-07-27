@@ -2,6 +2,8 @@ import { Router } from "express";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
+import { defaults } from "../config.js";
 import { notFoundResponse } from "./not-found.js";
 
 export const indexedRouter = Router();
@@ -12,7 +14,7 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+      if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
         res.status(400).json({ error: "Invalid contract address for agreements" });
         return;
       }
@@ -80,7 +82,7 @@ indexedRouter.get(
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
-    if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+    if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
       res.status(400).json({ error: "Invalid contract address for agreement details" });
       return;
     }
@@ -179,7 +181,7 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeAddr(defaults.payrollEscrowAddress)) {
+      if (contractAddress !== normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
         res.status(400).json({ error: "Invalid contract address for escrow balance" });
         return;
       }

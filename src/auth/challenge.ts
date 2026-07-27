@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
@@ -69,7 +70,21 @@ export const MAX_CHALLENGES = 100_000;
  * refuses to store a new entry and throws so the route layer can surface
  * the failure rather than silently dropping a security-relevant signal.
  */
+const challenges = new Map<string, { nonce: string; expiresAtMs: number }>();
 const chainIdCache = new Map<string, string>();
+
+/** Decodes a Starknet chain-ID felt into a human-readable label (e.g. "SN_SEPOLIA"). */
+function getChainIdLabel(chainId: string): string {
+  const cached = chainIdCache.get(chainId);
+  if (cached) return cached;
+  try {
+    const label = shortString.decodeShortString(chainId);
+    chainIdCache.set(chainId, label);
+    return label;
+  } catch {
+    return chainId;
+  }
+}
 
 /**
  * Number of `createChallenge` calls between opportunistic sweeps of expired entries.
@@ -245,7 +260,6 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
   // - domain.name/version: plain string
   // - message.action: plain string
   // (starknet.js will encode these according to the declared `felt` types when hashing/verifying)
-  const chainIdLabel = shortString.decodeShortString(chainId);
   return {
     types: CHALLENGE_TYPES,
     primaryType: "Challenge",

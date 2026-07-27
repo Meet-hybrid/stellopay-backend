@@ -131,11 +131,11 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, limit);
 
-    const unreadCount = calculateUnreadCount(notifications);
+    const unreadCount = calculateUnreadCount(rawNotifications);
 
     res.json({
-      notifications,
-      total: notifications.length,
+      notifications: rawNotifications,
+      total: rawNotifications.length,
       unreadCount,
     });
   } catch (e) {

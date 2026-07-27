@@ -172,9 +172,6 @@ describe("notifications route", () => {
 
     const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
     expect(res.body.notifications).toHaveLength(1);
-  });
-});
-
     expect(res.body.total).toBe(3);
     expect(res.body.unreadCount).toBe(3);
     expect(res.body.notifications).toHaveLength(3);

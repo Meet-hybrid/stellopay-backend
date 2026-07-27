@@ -7,7 +7,7 @@ import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { processTxReceipt, normalizeTransactionHash, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
@@ -135,7 +135,7 @@ reprocessEventsRouter.post(
         })
         .parse(req.body);
 
-      const results = [];
+      const results: Array<{ txHash?: string; status: string; eventsProcessed: number; eventLabels?: string[]; error?: string }> = [];
       // Cache of normalized hash -> result object, so duplicate hashes reuse
       // the first occurrence's result instead of triggering another RPC call.
       const resultByNormalizedHash = new Map<string, (typeof results)[number]>();

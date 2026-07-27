@@ -708,6 +708,8 @@ describe("sessions", () => {
     await revokeSessionByHash(tokenHash);
     const session = await getSessionByHash(tokenHash);
     expect(session!.revokedAt).toBeInstanceOf(Date);
+  });
+
   // ---------------------------------------------------------------------------
   // Input validation: hardened boundary and malformed-input paths (#307)
   // ---------------------------------------------------------------------------
@@ -824,6 +826,8 @@ describe("sessions", () => {
     const { token } = await createSession("0xTrimMe");
     // Padded address supplied by the caller — should still match
     expect(await requireSession("  0xTrimMe  ", token)).toBe(true);
+  });
+
   // Reliability: bounded retry + idempotent re-revoke detection (issue #125)
   //
   // These tests use `vi.useRealTimers()` inside the test body because the

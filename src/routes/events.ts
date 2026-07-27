@@ -636,21 +636,6 @@ eventsRouter.post(
         results.push(errorResult);
       }
 
-      const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
-
-      res.json({
-        summary: {
-          total: results.length,
-          processed: results.filter((r) => r.status === "processed").length,
-          noEvents: results.filter((r) => r.status === "no_events").length,
-          notFound: results.filter((r) => r.status === "not_found").length,
-          errors: results.filter((r) => r.status === "error").length,
-          totalEventsProcessed: totalProcessed,
-        },
-        results,
-      });
-    } catch (e) {
-      next(e);
     }
 
     // Stats are derived from the unique (deduplicated) results so a hash that
