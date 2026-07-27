@@ -380,3 +380,38 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
     next(e);
   }
 });
+
+// -------- cursor-based reads and record ordering --------
+const CursorQuery = z.object({
+  cursor: z.string().optional(),
+  order: z.enum(["asc", "desc"]).default("desc"),
+  limit: z.coerce.number().min(1).max(100).default(50),
+});
+
+readRouter.get("/records/cursor/:address", async (req, res, next) => {
+  try {
+    const address = AddressParam.parse(req.params.address);
+    const { cursor, order, limit } = CursorQuery.parse(req.query);
+
+    // explicit security boundary
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    
+    // verify the caller matches the requested address
+    const token = authHeader.split(" ")[1];
+    if (token !== address) {
+      return res.status(403).json({ error: "Forbidden: privilege check failed" });
+    }
+
+    res.json({
+      address,
+      records: [],
+      nextCursor: null,
+      order,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
