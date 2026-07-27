@@ -618,3 +618,525 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.body.summary.total).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests – cursor pagination helpers (encodeCursor / decodeCursor)
+// ---------------------------------------------------------------------------
+
+import { encodeCursor, decodeCursor } from "./events.js";
+import type { EventCursorPayload } from "./events.js";
+
+describe("encodeCursor / decodeCursor", () => {
+  const payload: EventCursorPayload = {
+    blockNumber: 42,
+    eventIndex: 3,
+    id: "0xaaaa_0",
+  };
+
+  it("round-trips a valid payload", () => {
+    const cursor = encodeCursor(payload);
+    expect(decodeCursor(cursor)).toEqual(payload);
+  });
+
+  it("produces a base64url string (no +, /, or = padding chars)", () => {
+    const cursor = encodeCursor(payload);
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("returns null for an empty string", () => {
+    expect(decodeCursor("")).toBeNull();
+  });
+
+  it("returns null for a plain string that is not base64url JSON", () => {
+    expect(decodeCursor("notavalidcursor")).toBeNull();
+  });
+
+  it("returns null for a base64url string whose JSON is missing required fields", () => {
+    const bad = Buffer.from(JSON.stringify({ blockNumber: 1 })).toString("base64url");
+    expect(decodeCursor(bad)).toBeNull();
+  });
+
+  it("returns null when id is an empty string", () => {
+    const bad = Buffer.from(
+      JSON.stringify({ blockNumber: 1, eventIndex: 0, id: "" }),
+    ).toString("base64url");
+    expect(decodeCursor(bad)).toBeNull();
+  });
+
+  it("returns null for a non-object JSON value (number, array, null)", () => {
+    for (const v of [42, [1, 2], null]) {
+      const bad = Buffer.from(JSON.stringify(v)).toString("base64url");
+      expect(decodeCursor(bad)).toBeNull();
+    }
+  });
+
+  it("returns null for a cursor with wrong field types", () => {
+    const bad = Buffer.from(
+      JSON.stringify({ blockNumber: "not-a-number", eventIndex: 0, id: "x" }),
+    ).toString("base64url");
+    expect(decodeCursor(bad)).toBeNull();
+  });
+
+  it("a cursor from one page cannot be replayed as a smaller-offset cursor", () => {
+    // Two payloads with different blockNumbers produce distinct, incomparable
+    // cursors — there is no arithmetic relationship between them.
+    const c1 = encodeCursor({ blockNumber: 10, eventIndex: 0, id: "tx_0" });
+    const c2 = encodeCursor({ blockNumber: 20, eventIndex: 0, id: "tx_0" });
+    expect(c1).not.toBe(c2);
+    // Decoding either still yields the original values — no cross-contamination.
+    expect(decodeCursor(c1)?.blockNumber).toBe(10);
+    expect(decodeCursor(c2)?.blockNumber).toBe(20);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – GET /events/list (cursor-based pagination)
+// ---------------------------------------------------------------------------
+
+describe("GET /events/list – cursor pagination", () => {
+  // Lightweight in-memory store that mimics the DB select chain used by the route.
+  type EventRow = {
+    id: string;
+    agreementId: string;
+    contractAddress: string;
+    eventType: string;
+    blockNumber: number;
+    transactionHash: string;
+    eventIndex: number;
+    createdAt: Date;
+  };
+
+  let eventStore: EventRow[] = [];
+  // Tracks the decoded cursor the mock should apply. Set by each request helper
+  // before calling wireDbSelect so the limit mock filters correctly.
+  let activeCursor: EventCursorPayload | null = null;
+  // Optional row-level filter for agreement_id / event_type tests.
+  let testFilter: ((rows: EventRow[]) => EventRow[]) = (r) => r;
+
+  function makeRow(
+    overrides: Partial<EventRow> & { id: string; blockNumber: number; eventIndex: number },
+  ): EventRow {
+    return {
+      agreementId: "1",
+      contractAddress: AGREEMENT_ADDRESS,
+      eventType: "AgreementCreated",
+      transactionHash: "0x" + overrides.id.replace(/[^0-9a-f]/g, "").padStart(64, "0"),
+      createdAt: new Date(),
+      ...overrides,
+    };
+  }
+
+  /** Wire the db.select mock to return rows from eventStore with cursor / filter / limit logic. */
+  function wireDbSelect() {
+    const selectMock = vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockReturnValue({
+            limit: vi.fn().mockImplementation((n: number) => {
+              // Mirror the SQL logic in JS so cursor-based tests work without a real DB.
+              let rows = [...eventStore];
+
+              // Apply optional filters set by individual tests via closure.
+              rows = testFilter(rows);
+
+              // Apply cursor keyset condition when one is active.
+              if (activeCursor) {
+                const { blockNumber: cb, eventIndex: ci, id: cid } = activeCursor;
+                rows = rows.filter((r) => {
+                  if (r.blockNumber > cb) return true;
+                  if (r.blockNumber === cb && r.eventIndex > ci) return true;
+                  if (r.blockNumber === cb && r.eventIndex === ci && r.id > cid) return true;
+                  return false;
+                });
+              }
+
+              // Stable sort: blockNumber ASC, eventIndex ASC, id ASC
+              rows.sort((a, b) => {
+                if (a.blockNumber !== b.blockNumber) return a.blockNumber - b.blockNumber;
+                if (a.eventIndex !== b.eventIndex) return a.eventIndex - b.eventIndex;
+                return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+              });
+
+              return Promise.resolve(rows.slice(0, n));
+            }),
+          }),
+        }),
+      }),
+    });
+    (db as any).select = selectMock;
+  }
+
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    app.use((err: any, _req: any, res: any, _next: any) => {
+      res.status(err.status ?? 500).json({ error: err.message });
+    });
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rewireDbInsert();
+    eventStore = [];
+    testFilter = (r) => r;
+    activeCursor = null;
+    wireDbSelect();
+  });
+
+  /**
+   * Makes a GET /events/list request, automatically decoding the cursor from
+   * the URL and setting `activeCursor` so the mock applies the correct keyset
+   * filter. This removes the need for per-test cursor setup.
+   */
+  async function getPage(app: ReturnType<typeof makeApp>, url: string) {
+    // Extract cursor param from url and decode it for the mock.
+    const match = url.match(/[?&]cursor=([^&]+)/);
+    activeCursor = match ? decodeCursor(decodeURIComponent(match[1])) : null;
+    wireDbSelect();
+    return request(app).get(url);
+  }
+
+  // ── first page, no cursor ────────────────────────────────────────────────
+
+  it("returns an empty page with no nextCursor when there are no events", async () => {
+    const res = await request(makeApp()).get("/events/list");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toEqual([]);
+    expect(res.body.nextCursor).toBeNull();
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body.count).toBe(0);
+  });
+
+  it("returns all events on a single page when count <= limit", async () => {
+    for (let i = 0; i < 3; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+    wireDbSelect();
+
+    const res = await request(makeApp()).get("/events/list?limit=10");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(3);
+    expect(res.body.nextCursor).toBeNull();
+    expect(res.body.hasMore).toBe(false);
+  });
+
+  it("returns hasMore=true and a non-null nextCursor when more rows exist", async () => {
+    for (let i = 0; i < 5; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+    wireDbSelect();
+
+    const res = await request(makeApp()).get("/events/list?limit=3");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(3);
+    expect(res.body.hasMore).toBe(true);
+    expect(res.body.nextCursor).not.toBeNull();
+  });
+
+  // ── stable ordering ──────────────────────────────────────────────────────
+
+  it("returns events in stable (blockNumber, eventIndex, id) order", async () => {
+    // Insert in reverse order to confirm sort is applied.
+    eventStore.push(makeRow({ id: "tx_c_0", blockNumber: 3, eventIndex: 0 }));
+    eventStore.push(makeRow({ id: "tx_a_0", blockNumber: 1, eventIndex: 0 }));
+    eventStore.push(makeRow({ id: "tx_b_0", blockNumber: 2, eventIndex: 0 }));
+    wireDbSelect();
+
+    const res = await request(makeApp()).get("/events/list?limit=10");
+    expect(res.status).toBe(200);
+    const ids: string[] = res.body.events.map((e: EventRow) => e.id);
+    expect(ids).toEqual(["tx_a_0", "tx_b_0", "tx_c_0"]);
+  });
+
+  it("breaks ties within the same block by eventIndex then id", async () => {
+    eventStore.push(makeRow({ id: "tx_z_1", blockNumber: 5, eventIndex: 1 }));
+    eventStore.push(makeRow({ id: "tx_z_0", blockNumber: 5, eventIndex: 0 }));
+    eventStore.push(makeRow({ id: "tx_a_2", blockNumber: 5, eventIndex: 2 }));
+    wireDbSelect();
+
+    const res = await request(makeApp()).get("/events/list?limit=10");
+    const ids: string[] = res.body.events.map((e: EventRow) => e.id);
+    expect(ids).toEqual(["tx_z_0", "tx_z_1", "tx_a_2"]);
+  });
+
+  // ── multi-page traversal ─────────────────────────────────────────────────
+
+  it("paginating through all pages returns every event exactly once", async () => {
+    const total = 7;
+    for (let i = 0; i < total; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    const app = makeApp();
+    const pageSize = 3;
+    const seen: string[] = [];
+    let cursor: string | null | undefined = undefined;
+
+    for (let page = 0; ; page++) {
+      const url = cursor
+        ? `/events/list?limit=${pageSize}&cursor=${cursor}`
+        : `/events/list?limit=${pageSize}`;
+      const res = await getPage(app, url);
+      expect(res.status).toBe(200);
+
+      for (const evt of res.body.events as EventRow[]) {
+        expect(seen).not.toContain(evt.id); // no duplicates
+        seen.push(evt.id);
+      }
+
+      cursor = res.body.nextCursor;
+      if (!res.body.hasMore) break;
+      if (page > total) throw new Error("infinite loop guard");
+    }
+
+    expect(seen).toHaveLength(total);
+  });
+
+  it("nextCursor is null on the last page", async () => {
+    for (let i = 0; i < 4; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    const app = makeApp();
+    // Page 1
+    const p1 = await getPage(app, "/events/list?limit=3");
+    expect(p1.body.hasMore).toBe(true);
+    expect(p1.body.nextCursor).not.toBeNull();
+
+    // Page 2 (last)
+    const p2 = await getPage(app, `/events/list?limit=3&cursor=${p1.body.nextCursor}`);
+    expect(p2.status).toBe(200);
+    expect(p2.body.hasMore).toBe(false);
+    expect(p2.body.nextCursor).toBeNull();
+  });
+
+  it("new events inserted after page 1 do not appear on page 1 or corrupt page 2", async () => {
+    // Seed 4 events with blockNumbers 1-4
+    for (let i = 0; i < 4; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    const app = makeApp();
+    const p1 = await getPage(app, "/events/list?limit=2");
+    const p1Ids: string[] = p1.body.events.map((e: EventRow) => e.id);
+    // p1 has tx_0_0, tx_1_0
+
+    // Insert a new event at blockNumber 5 — strictly after the existing 4 rows
+    eventStore.push(makeRow({ id: "tx_new_0", blockNumber: 5, eventIndex: 0 }));
+
+    // p2 returns tx_2_0, tx_3_0 and peeks at tx_new_0 to set hasMore=true
+    const p2 = await getPage(app, `/events/list?limit=2&cursor=${p1.body.nextCursor}`);
+    const p2Ids: string[] = p2.body.events.map((e: EventRow) => e.id);
+
+    // No overlap between p1 and p2
+    for (const id of p2Ids) expect(p1Ids).not.toContain(id);
+    expect(p2Ids).toContain("tx_2_0");
+    expect(p2Ids).toContain("tx_3_0");
+    // tx_new_0 is beyond p2's window — hasMore is true and it appears on p3
+    expect(p2Ids).not.toContain("tx_new_0");
+    expect(p2.body.hasMore).toBe(true);
+
+    // p3 contains the newly inserted event
+    const p3 = await getPage(app, `/events/list?limit=2&cursor=${p2.body.nextCursor}`);
+    expect(p3.body.events.map((e: EventRow) => e.id)).toContain("tx_new_0");
+  });
+
+  // ── cursor robustness ────────────────────────────────────────────────────
+
+  it("an invalid cursor is treated as the first page (fail-open)", async () => {
+    for (let i = 0; i < 2; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    const res = await getPage(makeApp(), "/events/list?cursor=thisisnotavalidcursor");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(2);
+  });
+
+  it("an empty cursor param is treated as the first page", async () => {
+    eventStore.push(makeRow({ id: "tx_0_0", blockNumber: 1, eventIndex: 0 }));
+
+    const res = await getPage(makeApp(), "/events/list?cursor=");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+  });
+
+  // ── limit clamping ───────────────────────────────────────────────────────
+
+  it("clamps an oversized limit to MAX_PAGE_LIMIT", async () => {
+    for (let i = 0; i < 5; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    // limit=9999 should be clamped to MAX_PAGE_LIMIT (100); store only has 5 rows
+    const res = await getPage(makeApp(), "/events/list?limit=9999");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(5);
+    expect(res.body.hasMore).toBe(false);
+  });
+
+  it("uses DEFAULT_PAGE_LIMIT when no limit param is supplied", async () => {
+    const res = await getPage(makeApp(), "/events/list");
+    expect(res.status).toBe(200);
+    expect(typeof res.body.count).toBe("number");
+  });
+
+  it("clamps limit=0 to 1", async () => {
+    eventStore.push(makeRow({ id: "tx_0_0", blockNumber: 1, eventIndex: 0 }));
+    eventStore.push(makeRow({ id: "tx_1_0", blockNumber: 2, eventIndex: 0 }));
+
+    const res = await getPage(makeApp(), "/events/list?limit=0");
+    expect(res.status).toBe(200);
+    // limit clamped to 1 — exactly one event returned
+    expect(res.body.events).toHaveLength(1);
+  });
+
+  // ── response shape ───────────────────────────────────────────────────────
+
+  it("response always contains events, nextCursor, hasMore, and count fields", async () => {
+    const res = await getPage(makeApp(), "/events/list");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.events)).toBe(true);
+    expect("nextCursor" in res.body).toBe(true);
+    expect(typeof res.body.hasMore).toBe("boolean");
+    expect(typeof res.body.count).toBe("number");
+  });
+
+  it("count equals events.length on every page", async () => {
+    for (let i = 0; i < 5; i++) {
+      eventStore.push(makeRow({ id: `tx_${i}_0`, blockNumber: i + 1, eventIndex: 0 }));
+    }
+
+    const app = makeApp();
+    let cursor: string | null | undefined;
+    let page = 0;
+    do {
+      const url = cursor
+        ? `/events/list?limit=2&cursor=${cursor}`
+        : `/events/list?limit=2`;
+      const res = await getPage(app, url);
+      expect(res.body.count).toBe(res.body.events.length);
+      cursor = res.body.nextCursor;
+      if (++page > 10) break;
+    } while (cursor);
+  });
+
+  // ── validation errors ────────────────────────────────────────────────────
+
+  it("returns 400 when agreement_id is an empty string", async () => {
+    const res = await getPage(makeApp(), "/events/list?agreement_id=");
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid query parameters");
+    expect(Array.isArray(res.body.details)).toBe(true);
+  });
+
+  it("returns 400 when event_type is an empty string", async () => {
+    const res = await getPage(makeApp(), "/events/list?event_type=");
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid query parameters");
+    expect(Array.isArray(res.body.details)).toBe(true);
+  });
+
+  // ── optional filters ─────────────────────────────────────────────────────
+
+  it("agreement_id filter returns only events for the specified agreement", async () => {
+    // Mix two agreement IDs in the store
+    eventStore.push(makeRow({ id: "tx_a1_0", blockNumber: 1, eventIndex: 0, agreementId: "1" }));
+    eventStore.push(makeRow({ id: "tx_a2_0", blockNumber: 2, eventIndex: 0, agreementId: "2" }));
+    eventStore.push(makeRow({ id: "tx_a1_1", blockNumber: 3, eventIndex: 0, agreementId: "1" }));
+
+    // Wire a filter that mirrors what the SQL WHERE clause would do
+    testFilter = (rows) => rows.filter((r) => r.agreementId === "2");
+    wireDbSelect();
+
+    const res = await getPage(makeApp(), "/events/list?agreement_id=2");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0].id).toBe("tx_a2_0");
+  });
+
+  it("event_type filter returns only events of the specified type", async () => {
+    eventStore.push(
+      makeRow({ id: "tx_type_a", blockNumber: 1, eventIndex: 0, eventType: "AgreementCreated" }),
+    );
+    eventStore.push(
+      makeRow({ id: "tx_type_b", blockNumber: 2, eventIndex: 0, eventType: "PaymentSent" }),
+    );
+    eventStore.push(
+      makeRow({ id: "tx_type_c", blockNumber: 3, eventIndex: 0, eventType: "AgreementCreated" }),
+    );
+
+    testFilter = (rows) => rows.filter((r) => r.eventType === "PaymentSent");
+    wireDbSelect();
+
+    const res = await getPage(makeApp(), "/events/list?event_type=PaymentSent");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0].id).toBe("tx_type_b");
+  });
+
+  it("filter and cursor pagination together return each matching event exactly once", async () => {
+    // 5 events for agreement "42", interleaved with unrelated events
+    for (let i = 0; i < 5; i++) {
+      eventStore.push(
+        makeRow({ id: `tx_match_${i}`, blockNumber: i * 2, eventIndex: 0, agreementId: "42" }),
+      );
+      eventStore.push(
+        makeRow({ id: `tx_other_${i}`, blockNumber: i * 2 + 1, eventIndex: 0, agreementId: "99" }),
+      );
+    }
+
+    // The mock filter will only be applied after wireDbSelect – track the active
+    // filter in the closure and reset it when wireDbSelect rebuilds the mock.
+    const filterFn = (rows: EventRow[]) => rows.filter((r) => r.agreementId === "42");
+    testFilter = filterFn;
+
+    const app = makeApp();
+    const pageSize = 2;
+    const seen: string[] = [];
+    let cursor: string | null | undefined;
+
+    for (let page = 0; ; page++) {
+      const base = `/events/list?agreement_id=42&limit=${pageSize}`;
+      const url = cursor ? `${base}&cursor=${cursor}` : base;
+      const res = await getPage(app, url);
+      expect(res.status).toBe(200);
+
+      for (const evt of res.body.events as EventRow[]) {
+        expect(seen).not.toContain(evt.id);
+        seen.push(evt.id);
+        expect(evt.agreementId).toBe("42");
+      }
+
+      cursor = res.body.nextCursor;
+      if (!res.body.hasMore) break;
+      if (page > 10) throw new Error("infinite loop guard");
+    }
+
+    expect(seen).toHaveLength(5);
+    expect(seen.every((id) => id.startsWith("tx_match_"))).toBe(true);
+  });
+
+  it("combined agreement_id and event_type filters narrow results correctly", async () => {
+    eventStore.push(
+      makeRow({ id: "match", blockNumber: 1, eventIndex: 0, agreementId: "7", eventType: "AgreementActivated" }),
+    );
+    eventStore.push(
+      makeRow({ id: "wrong_type", blockNumber: 2, eventIndex: 0, agreementId: "7", eventType: "PaymentSent" }),
+    );
+    eventStore.push(
+      makeRow({ id: "wrong_id", blockNumber: 3, eventIndex: 0, agreementId: "8", eventType: "AgreementActivated" }),
+    );
+
+    testFilter = (rows) =>
+      rows.filter((r) => r.agreementId === "7" && r.eventType === "AgreementActivated");
+    wireDbSelect();
+
+    const res = await getPage(makeApp(), "/events/list?agreement_id=7&event_type=AgreementActivated");
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0].id).toBe("match");
+  });
+});
