@@ -72,7 +72,7 @@ vi.mock("drizzle-orm", () => ({
   desc: () => "desc",
 }));
 
-import { indexedRouter } from "./indexed";
+import { indexedRouter, deriveSyncCheckpoint, INDEXED_DATA_SOURCE, MAX_INTERNAL_LIMIT } from "./indexed";
 
 const VALID = `0x${"a".repeat(63)}1`;
 
@@ -250,5 +250,48 @@ describe("indexed routes data paths", () => {
     expect(res.status).toBe(200);
     expect(res.body.balance).toBe("500");
     expect(res.body.agreement_id).toBe("7");
+  });
+});
+
+describe("indexer freshness and sync checkpoint helpers", () => {
+  it("exposes expected indexer contract constants", () => {
+    expect(INDEXED_DATA_SOURCE).toBe("indexed");
+    expect(MAX_INTERNAL_LIMIT).toBe(200);
+  });
+
+  describe("deriveSyncCheckpoint", () => {
+    it("success path: derives maximum block number from numeric and bigint block numbers", () => {
+      const records = [
+        { blockNumber: 100 },
+        { blockNumber: BigInt(500) },
+        { blockNumber: 250 },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(500);
+    });
+
+    it("boundary path: returns 0 for empty, null, or undefined records input", () => {
+      expect(deriveSyncCheckpoint([])).toBe(0);
+      expect(deriveSyncCheckpoint(null as any)).toBe(0);
+      expect(deriveSyncCheckpoint(undefined as any)).toBe(0);
+    });
+
+    it("boundary path: returns 0 when no valid block numbers exist in records", () => {
+      const records = [
+        {},
+        { blockNumber: null },
+        { blockNumber: undefined },
+        { blockNumber: NaN },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(0);
+    });
+
+    it("boundary path: ignores invalid or negative block numbers and finds max positive block", () => {
+      const records = [
+        { blockNumber: -10 },
+        { blockNumber: 12345 },
+        { blockNumber: null },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(12345);
+    });
   });
 });

@@ -64,6 +64,54 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
   }
 }
 
+/**
+ * Zod schema for query parameters in GET /analytics/:user_address.
+ * Normalizes null or empty string to undefined so missing/empty year falls back
+ * to the current year, while rejecting non-integer, out-of-range, or malformed inputs.
+ */
+const AnalyticsQuerySchema = z.object({
+  year: z.preprocess(
+    (val) => (val === "" || val === null ? undefined : val),
+    z.coerce
+      .number()
+      .int("year must be an integer")
+      .min(2020, "year must be >= 2020")
+      .max(2100, "year must be <= 2100")
+      .optional(),
+  ),
+});
+
+/**
+ * Safely parses raw amount values (bigint, number, string, null, undefined) into BigInt.
+ * Returns 0n for malformed or missing values to prevent runtime exceptions in aggregation.
+ */
+export function parseBigIntSafe(val: unknown): bigint {
+  if (val === null || val === undefined || val === "") return 0n;
+  if (typeof val === "bigint") return val;
+  if (typeof val === "number") {
+    if (!Number.isFinite(val)) return 0n;
+    return BigInt(Math.floor(val));
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!/^-?\d+$/.test(trimmed)) return 0n;
+    try {
+      return BigInt(trimmed);
+    } catch {
+      return 0n;
+    }
+  }
+  return 0n;
+}
+
+/**
+ * Checks if a value is a valid calendar month (1 through 12).
+ */
+export function isValidMonth(month: unknown): month is number {
+  const num = Number(month);
+  return Number.isInteger(num) && num >= 1 && num <= 12;
+}
+
 // Get analytics data (monthly payment amounts) for a user
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   const start = process.hrtime.bigint();
@@ -74,9 +122,8 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // cannot produce a surprising lookup key; an invalid address throws a
     // ZodError that the global handler maps to a 400 before any DB query.
     const userAddress = StarknetAddress.parse(req.params.user_address);
-    const year =
-      z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) ||
-      new Date().getFullYear();
+    const { year: parsedYear } = AnalyticsQuerySchema.parse(req.query);
+    const year = parsedYear ?? new Date().getFullYear();
 
     // Get all payments for the user in the specified year
     const startDate = new Date(year, 0, 1);
@@ -164,7 +211,8 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // Sum payment amounts (received payments are positive, sent are negative)
     payments.forEach((p) => {
       const month = Number(p.month);
-      const amount = BigInt(p.amount);
+      if (!isValidMonth(month)) return;
+      const amount = parseBigIntSafe(p.amount);
       if (p.from === userAddress) {
         monthlyData[month] = (monthlyData[month] || 0n) - amount;
       }
@@ -176,7 +224,8 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // Add escrow events (funding is negative, releases/refunds are positive)
     escrowEvents.forEach((e) => {
       const month = Number(e.month);
-      const amount = BigInt(e.amount);
+      if (!isValidMonth(month)) return;
+      const amount = parseBigIntSafe(e.amount);
       if (e.eventType === "Funded") {
         if (e.employer === userAddress) {
           monthlyData[month] = (monthlyData[month] || 0n) - amount; // Funding is outgoing
@@ -197,6 +246,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     const agreementCountsByMonth: Record<number, number> = {};
     agreementCreations.forEach((a: any) => {
       const month = Number(a.month);
+      if (!isValidMonth(month)) return;
       agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;
     });
 
@@ -206,9 +256,11 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       // Multiply by a base amount to make it visible on chart
       Object.keys(agreementCountsByMonth).forEach((monthStr) => {
         const month = Number(monthStr);
-        const count = agreementCountsByMonth[month];
-        // Use a base value (e.g., 1000 per agreement) for visualization when no payments exist
-        monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
+        if (isValidMonth(month)) {
+          const count = agreementCountsByMonth[month];
+          // Use a base value (e.g., 1000 per agreement) for visualization when no payments exist
+          monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
+        }
       });
     }
 
@@ -256,14 +308,16 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // Only log telemetry for errors that are not Zod validation failures;
     // those are surfaced as 400s by the global error handler and do not
     // represent a backend data path failure.
-    logAnalyticsTelemetry({
-      operation: "analytics_monthly_rollup",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "error",
-      request_id: requestId,
-      user_address: req.params.user_address,
-      error: e?.message || String(e),
-    });
+    if (!(e instanceof z.ZodError)) {
+      logAnalyticsTelemetry({
+        operation: "analytics_monthly_rollup",
+        duration_ms: Math.round(duration * 100) / 100,
+        status: "error",
+        request_id: requestId,
+        user_address: req.params.user_address,
+        error: e?.message || String(e),
+      });
+    }
     next(e);
   }
 });
