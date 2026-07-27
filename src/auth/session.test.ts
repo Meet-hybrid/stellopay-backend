@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import crypto from "node:crypto";
+import { env } from "../config.js";
 
 // Force the session logger into line-based (non-JSON) output and lower the
 // minimum level to "debug" so the new observability tests can grep for
@@ -149,6 +150,8 @@ import {
   rotateSession,
   revokeFamily,
   revokeAllSessionsForAddress,
+  getSessionByHash,
+  revokeSessionByHash,
 } from "./session";
 import {
   getSessionMetricsSnapshot,
@@ -202,6 +205,29 @@ describe("sessions", () => {
   it("returns a real expires_in_ms instead of null", async () => {
     const { expires_in_ms } = await createSession("0x111");
     expect(expires_in_ms).toBeGreaterThan(0);
+  });
+
+  it("persists a sliding expiry and an absolute expiry cap for each session", async () => {
+    const { expires_in_ms } = await createSession("0xPersist");
+    const stored = mockState.sessions[0];
+
+    expect(stored.address).toBe("0xpersist");
+    expect(stored.expiresAt.getTime()).toBe(Date.now() + expires_in_ms);
+    expect(stored.absoluteExpiresAt.getTime()).toBe(Date.now() + env.SESSION_MAX_TTL_MS);
+  });
+
+  it("refreshes the sliding expiry without extending past the absolute cap", async () => {
+    const { token } = await createSession("0xContract");
+    const before = mockState.sessions[0];
+    const beforeExpiresAtMs = before.expiresAt.getTime();
+    const beforeAbsoluteExpiresAtMs = before.absoluteExpiresAt.getTime();
+
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    await requireSession("0xcontract", token);
+
+    const after = mockState.sessions[0];
+    expect(after.expiresAt.getTime()).toBeGreaterThan(beforeExpiresAtMs);
+    expect(after.absoluteExpiresAt.getTime()).toBe(beforeAbsoluteExpiresAtMs);
   });
 
   it("rejects and removes a session once its TTL elapses", async () => {
@@ -663,7 +689,141 @@ describe("sessions", () => {
     }
   });
 
+  it("getSessionByHash retrieves a session by its token hash", async () => {
+    const { token } = await createSession("0xGetHash");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const session = await getSessionByHash(tokenHash);
+    expect(session).not.toBeNull();
+    expect(session!.address).toBe("0xgethash");
+  });
+
+  it("getSessionByHash returns null for non-existent token hash", async () => {
+    const session = await getSessionByHash("non-existent-hash");
+    expect(session).toBeNull();
+  });
+
+  it("revokeSessionByHash marks a session as revoked", async () => {
+    const { token } = await createSession("0xRevokeHash");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    await revokeSessionByHash(tokenHash);
+    const session = await getSessionByHash(tokenHash);
+    expect(session!.revokedAt).toBeInstanceOf(Date);
   // ---------------------------------------------------------------------------
+  // Input validation: hardened boundary and malformed-input paths (#307)
+  // ---------------------------------------------------------------------------
+
+  it("createSession rejects an empty address with a TypeError", async () => {
+    await expect(createSession("")).rejects.toThrow(TypeError);
+    await expect(createSession("")).rejects.toThrow("address must be a non-empty string");
+  });
+
+  it("createSession rejects a whitespace-only address with a TypeError", async () => {
+    await expect(createSession("   ")).rejects.toThrow(TypeError);
+    await expect(createSession("   ")).rejects.toThrow("address must be a non-empty string");
+  });
+
+  it("createSession with an empty address does not persist any session row", async () => {
+    await expect(createSession("")).rejects.toThrow();
+    expect(mockState.sessions).toHaveLength(0);
+  });
+
+  it("createSession with empty address increments session_rejected_total and does not increment session_created_total", async () => {
+    await expect(createSession("")).rejects.toThrow();
+    const counters = getSessionMetricsSnapshot().counters;
+    expect(counters[SESSION_METRICS.REJECTED]).toBe(1);
+    expect(counters[SESSION_METRICS.CREATED] ?? 0).toBe(0);
+  });
+
+  it("requireSession rejects a whitespace-only token and returns false", async () => {
+    await createSession("0xabc");
+    expect(await requireSession("0xabc", "   ")).toBe(false);
+  });
+
+  it("requireSession rejects a whitespace-only address and returns false", async () => {
+    const { token } = await createSession("0xabc");
+    expect(await requireSession("   ", token)).toBe(false);
+  });
+
+  it("requireSession logs missing_input for whitespace-only token", async () => {
+    await createSession("0xabc");
+    consoleWarnSpy.mockClear();
+    await requireSession("0xabc", "   ");
+    const rejected = consoleWarnSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("missing_input"),
+    );
+    expect(rejected).toBeDefined();
+  });
+
+  it("requireSession logs missing_input for whitespace-only address", async () => {
+    const { token } = await createSession("0xabc");
+    consoleWarnSpy.mockClear();
+    await requireSession("   ", token);
+    const rejected = consoleWarnSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("missing_input"),
+    );
+    expect(rejected).toBeDefined();
+  });
+
+  it("revokeSession ignores a whitespace-only token without bumping revoked counter", async () => {
+    await revokeSession("   ");
+    expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKED] ?? 0).toBe(0);
+  });
+
+  it("rotateSession rejects a whitespace-only token", async () => {
+    const result = await rotateSession("0xabc", "   ");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("invalid");
+  });
+
+  it("rotateSession rejects a whitespace-only address", async () => {
+    const { token } = await createSession("0xabc");
+    const result = await rotateSession("   ", token);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("invalid");
+  });
+
+  it("rotateSession logs missing_input for whitespace-only inputs", async () => {
+    consoleWarnSpy.mockClear();
+    await rotateSession("0xabc", "   ");
+    const rejected = consoleWarnSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("missing_input"),
+    );
+    expect(rejected).toBeDefined();
+  });
+
+  it("revokeAllSessionsForAddress is a no-op for an empty address and does not bump all_revoked", async () => {
+    await createSession("0xaaa");
+    await revokeAllSessionsForAddress("");
+    // Session for 0xaaa must remain intact
+    const { token } = await createSession("0xaaa2");
+    // All-revoked counter must be 0 — the guard short-circuited before touching the DB
+    expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.ALL_REVOKED] ?? 0).toBe(0);
+    // The previously-created session is still valid
+    expect(await requireSession("0xaaa2", token)).toBe(true);
+  });
+
+  it("revokeAllSessionsForAddress is a no-op for a whitespace-only address", async () => {
+    await revokeAllSessionsForAddress("   ");
+    expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.ALL_REVOKED] ?? 0).toBe(0);
+    // The guard must emit a warn log so the no-op is observable
+    const rejected = consoleWarnSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("missing_input"),
+    );
+    expect(rejected).toBeDefined();
+  });
+
+  it("createSession normalises whitespace-padded address before persisting", async () => {
+    const { token } = await createSession("  0xPadded  ");
+    // The stored address must be the trimmed + lowercased form
+    expect(mockState.sessions[0].address).toBe("0xpadded");
+    // And requireSession with the clean address must succeed
+    expect(await requireSession("0xpadded", token)).toBe(true);
+  });
+
+  it("requireSession normalises a whitespace-padded address when validating", async () => {
+    const { token } = await createSession("0xTrimMe");
+    // Padded address supplied by the caller — should still match
+    expect(await requireSession("  0xTrimMe  ", token)).toBe(true);
   // Reliability: bounded retry + idempotent re-revoke detection (issue #125)
   //
   // These tests use `vi.useRealTimers()` inside the test body because the

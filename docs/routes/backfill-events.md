@@ -71,7 +71,7 @@ To guarantee that synthesized backfill events never collide with genuine on-chai
    Because genuine on-chain events use `{txHash}_{eventIndex}`, the `_backfill_` segment ensures collisions are impossible.
 
 2. **Sentinel Event Index**:
-   Every backfill row is inserted with an `eventIndex` of `-1` (`BACKFILL_EVENT_INDEX`). Real on-chain events always have an `eventIndex >= 0`.
+   Every backfill row is inserted with an `eventIndex` of `0` (`BACKFILL_EVENT_INDEX`). The `_backfill_` segment in the synthetic event ID is the primary mechanism that distinguishes backfill rows from real on-chain events.
 
 3. **Transaction Safety**:
    The database inserts run within a single transaction using `ON CONFLICT DO NOTHING`, rendering repeat calls completely safe (no-ops for already backfilled events). This guarantee is unaffected by `before`: since the cursor only narrows the candidate row set, re-running any page (with or without a cursor) never creates duplicate events.

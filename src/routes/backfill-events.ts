@@ -19,10 +19,11 @@ export const DEFAULT_BACKFILL_LIMIT = 1000;
 
 /**
  * Sentinel `eventIndex` value written for every synthetic backfill row.
- * Real on-chain events always have `eventIndex >= 0`, so **-1** makes
- * backfill rows trivially distinguishable.
+ * The `_backfill_` segment in the synthetic event ID already distinguishes
+ * backfill rows from real on-chain events, so eventIndex is set to 0 to
+ * satisfy the DB CHECK constraint (`event_index >= 0`).
  */
-export const BACKFILL_EVENT_INDEX = -1;
+export const BACKFILL_EVENT_INDEX = 0;
 
 /** How many result objects the response preview (`results` array) may contain. */
 export const RESULTS_PREVIEW_SIZE = 10;
@@ -152,20 +153,12 @@ backfillEventsRouter.post(
         conditions.append(sql` AND e.created_at < ${before}`);
       }
 
-      const employeesWithoutEvents = await db.execute(sql`
-        SELECT e.id, e.agreement_id, e.contract_address, e.block_number,
-               e.transaction_hash, e.created_at
-        FROM employees e
-        WHERE NOT EXISTS (
-          SELECT 1 FROM agreement_events ae
-          WHERE ae.agreement_id = e.agreement_id
-          AND ae.event_type = 'EmployeeAdded'
-          AND ae.transaction_hash = e.transaction_hash
-        )
-        AND ${conditions}
-        ORDER BY e.created_at DESC
-        LIMIT ${limit}
-      `);
+  const tableName = type === "EmployeeAdded" ? "employees" : "milestones";
+  const tableAlias = type === "EmployeeAdded" ? "e" : "m";
+  
+  const conditions = sql`1=1`;
+  if (agreementId) conditions.append(sql` AND ${sql.identifier(tableAlias)}.agreement_id = ${agreementId}`);
+  if (resumeToken) conditions.append(sql` AND ${sql.identifier(tableAlias)}.created_at < ${resumeToken}`);
 
       let created = 0;
       const results: BackfillResultEntry[] = [];
@@ -178,7 +171,7 @@ backfillEventsRouter.post(
             String(employee.id),
           );
 
-          await tx
+          const inserted = await tx
             .insert(schema.agreementEvents)
             .values({
               id: eventId,
@@ -189,13 +182,16 @@ backfillEventsRouter.post(
               transactionHash: String(employee.transaction_hash),
               eventIndex: BACKFILL_EVENT_INDEX,
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning();
 
-          created++;
+          if (inserted.length > 0) {
+            created++;
+          }
           results.push({
             employeeId: String(employee.id),
             agreementId: String(employee.agreement_id),
-            status: "created",
+            status: inserted.length > 0 ? "created" : "skipped",
           });
         }
       });
@@ -220,8 +216,7 @@ backfillEventsRouter.post(
       }
       next(e);
     }
-  },
-);
+  });
 
 /**
  * POST /backfill/milestone-events
@@ -272,20 +267,16 @@ backfillEventsRouter.post(
         conditions.append(sql` AND m.created_at < ${before}`);
       }
 
-      const milestonesWithoutEvents = await db.execute(sql`
-        SELECT m.id, m.agreement_id, m.contract_address, m.block_number,
-               m.transaction_hash, m.created_at
-        FROM milestones m
-        WHERE NOT EXISTS (
-          SELECT 1 FROM agreement_events ae
-          WHERE ae.agreement_id = m.agreement_id
-          AND ae.event_type = 'MilestoneAdded'
-          AND ae.transaction_hash = m.transaction_hash
-        )
-        AND ${conditions}
-        ORDER BY m.created_at DESC
-        LIMIT ${limit}
-      `);
+backfillEventsRouter.post("/backfill/employee-events", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const params = BackfillQuerySchema.parse(req.query);
+    const result = await performBackfill("EmployeeAdded", params);
+    res.json(result);
+  } catch (e) {
+    if (e instanceof z.ZodError) return res.status(400).json({ error: "Invalid parameters", details: err.issues });
+    next(e);
+  }
+});
 
       let created = 0;
       const results: BackfillResultEntry[] = [];
@@ -298,7 +289,7 @@ backfillEventsRouter.post(
             String(milestone.id),
           );
 
-          await tx
+          const inserted = await tx
             .insert(schema.agreementEvents)
             .values({
               id: eventId,
@@ -309,13 +300,16 @@ backfillEventsRouter.post(
               transactionHash: String(milestone.transaction_hash),
               eventIndex: BACKFILL_EVENT_INDEX,
             })
-            .onConflictDoNothing();
+            .onConflictDoNothing()
+            .returning();
 
-          created++;
+          if (inserted.length > 0) {
+            created++;
+          }
           results.push({
             milestoneId: String(milestone.id),
             agreementId: String(milestone.agreement_id),
-            status: "created",
+            status: inserted.length > 0 ? "created" : "skipped",
           });
         }
       });

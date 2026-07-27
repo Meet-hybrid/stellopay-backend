@@ -12,6 +12,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier . --write",
     "format:check": "prettier . --check",
+    "check:env": "tsx scripts/check-env-sync.ts",
     "prestart": "pnpm build",
     "start": "node dist/index.js",
     "test": "vitest run",

@@ -194,9 +194,19 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+// Named via vi.hoisted so individual tests can override behavior (e.g.
+// simulate requireAdmin rejecting a non-admin caller) with mockImplementationOnce.
+// vi.clearAllMocks() (used throughout this file) clears call history but not
+// the base implementation set here, so the default "always call next()"
+// behavior persists across tests unless explicitly overridden.
+const { mockRequireAuth, mockRequireAdmin } = vi.hoisted(() => ({
+  mockRequireAuth: vi.fn((_req: any, _res: any, next: any) => next()),
+  mockRequireAdmin: vi.fn((_req: any, _res: any, next: any) => next()),
+}));
+
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: mockRequireAuth,
+  requireAdmin: mockRequireAdmin,
 }));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
