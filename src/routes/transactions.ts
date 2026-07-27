@@ -12,27 +12,31 @@ const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
 
-export interface TransactionRecord {
-  id: string;
-  type: string;
-  address: string;
-  date: string;
-  time: string;
-  token: string;
-  amount: string;
-  status: "Completed";
-  tokenIcon: string;
-  txHash: string;
-  createdAt: Date;
-}
+export const TransactionRecordSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  address: z.string(),
+  date: z.string(),
+  time: z.string(),
+  token: z.string(),
+  amount: z.string(),
+  status: z.literal("Completed"),
+  tokenIcon: z.string(),
+  txHash: z.string(),
+  createdAt: z.date(),
+});
 
-export interface TransactionExport {
-  transactions: TransactionRecord[];
-  total: number;
-  hasMore: boolean;
-  limit: number;
-  offset: number;
-}
+export type TransactionRecord = z.infer<typeof TransactionRecordSchema>;
+
+export const TransactionExportSchema = z.object({
+  transactions: z.array(TransactionRecordSchema),
+  total: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+});
+
+export type TransactionExport = z.infer<typeof TransactionExportSchema>;
 /**
  * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
  * to "debug". These lines are noisy on the request hot path and can include
@@ -50,8 +54,8 @@ function debugLog(...args: unknown[]): void {
 }
 
 // Helper to format address for display (truncate like 0x1234...5678)
-function formatAddress(addr: string): string {
-  if (!addr || addr === "N/A") return addr;
+function formatAddress(addr: string | null | undefined): string {
+  if (!addr || addr === "N/A") return addr || "";
   const normalized = normalizeAddr(addr);
   if (normalized.length <= 10) return normalized;
   // Show first 6 chars and last 4 chars
@@ -310,7 +314,9 @@ function formatEventType(eventType: string): string {
 // Get all transactions for a user (from payments and escrow events)
 transactionsRouter.get("/transactions/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddr(req.params.user_address);
+    // Validate and normalize the user address parameter to prevent silent failures
+    const rawAddress = AddressParam.parse(req.params.user_address);
+    const userAddress = normalizeAddr(rawAddress);
     const requestedLimit =
       z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
     const limit = Math.min(requestedLimit, 100);
@@ -683,14 +689,25 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
     const paginatedTransactions = allTransactions.slice(offset, offset + limit);
     const hasMore = total > offset + limit;
 
-    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
+    // Enforce runtime export contract for safe replay and reconciliation
+    const exportData = TransactionExportSchema.parse({
+      transactions: paginatedTransactions,
+      total,
+      hasMore,
+      limit,
+      offset,
+    });
+
+    res.json(exportData);
   } catch (e) {
     next(e);
   }
 });
 transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddr(req.params.user_address);
+    // Validate and normalize the user address parameter
+    const rawAddress = AddressParam.parse(req.params.user_address);
+    const userAddress = normalizeAddr(rawAddress);
     const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
     const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
     const requestedLimit =
@@ -1000,7 +1017,16 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
     const paginatedTransactions = allTransactions.slice(offset, offset + limit);
     const hasMore = total > offset + limit;
 
-    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
+    // Enforce runtime export contract for safe replay and reconciliation
+    const exportData = TransactionExportSchema.parse({
+      transactions: paginatedTransactions,
+      total,
+      hasMore,
+      limit,
+      offset,
+    });
+
+    res.json(exportData);
   } catch (e) {
     next(e);
   }
