@@ -7,6 +7,8 @@ import {
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   loggedParse,
+  formatValidationError,
+  type ValidationErrorResponse,
 } from "./validation";
 
 // --------------------------------------------------------------------------
@@ -469,5 +471,74 @@ describe("loggedParse", () => {
     loggedParse(schema, "ok", "silentOnSuccess");
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+// --------------------------------------------------------------------------
+// formatValidationError
+// --------------------------------------------------------------------------
+
+describe("formatValidationError", () => {
+  it("returns 'Validation failed' with Zod issues for a ZodError", () => {
+    const raw = "not-a-number";
+    try {
+      z.number().parse(raw);
+    } catch (e) {
+      const result = formatValidationError(e);
+      expect(result).toMatchObject<ValidationErrorResponse>({
+        error: "Validation failed",
+        details: expect.any(Array),
+      });
+      expect(result.details?.length).toBeGreaterThanOrEqual(1);
+      expect(result.details![0]).toHaveProperty("message");
+      expect(result.details![0]).toHaveProperty("code");
+    }
+  });
+
+  it("returns 'Invalid request' without details for a non-Zod error", () => {
+    const result = formatValidationError(new Error("something broke"));
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+    expect(result.details).toBeUndefined();
+  });
+
+  it("returns 'Invalid request' without details for a plain string", () => {
+    const result = formatValidationError("unexpected string error");
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("returns 'Invalid request' without details for null / undefined input", () => {
+    expect(formatValidationError(null)).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+    expect(formatValidationError(undefined)).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("returns 'Invalid request' without details for an object that is not a ZodError", () => {
+    const result = formatValidationError({ custom: true });
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("preserves the original Zod issue shape in details", () => {
+    const schema = z.object({
+      name: z.string().min(1, "name is required"),
+      age: z.number().int().positive(),
+    });
+    try {
+      schema.parse({ name: "", age: -1 });
+    } catch (e) {
+      const result = formatValidationError(e);
+      expect(result.error).toBe("Validation failed");
+      expect(result.details).toHaveLength(2);
+      expect(result.details![0].path).toEqual(["name"]);
+      expect(result.details![1].path).toEqual(["age"]);
+    }
   });
 });
