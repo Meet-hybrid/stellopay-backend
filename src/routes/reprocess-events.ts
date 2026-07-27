@@ -16,11 +16,15 @@ import path from "path";
 export const reprocessEventsRouter = Router();
 
 /** Maximum number of events to reprocess in a single status‑changes request. */
-const MAX_STATUS_LIMIT = 1000;
-/** Backward‑compatible retry budget for reprocessing failures. */
-const MAX_RETRY_BUDGET = 3;
-/** Directory where quarantined transaction hashes are persisted. */
-const DEFAULT_QUARANTINE_PATH = path.resolve(process.cwd(), "quarantine");
+export const MAX_STATUS_LIMIT = 1000;
+
+/** Default retry budget for reprocessing failures. Can be overridden via the `RETRY_BUDGET` environment variable. */
+export const RETRY_BUDGET = Number(process.env.RETRY_BUDGET) || 3;
+
+/** Directory where quarantined transaction hashes are persisted. Can be overridden via the `QUARANTINE_PATH` environment variable. */
+export const QUARANTINE_PATH = process.env.QUARANTINE_PATH
+  ? path.resolve(process.env.QUARANTINE_PATH)
+  : path.resolve(process.cwd(), "quarantine");
 /** In‑memory map tracking retry attempts per normalized transaction hash. */
 const retryCounts = new Map<string, number>();
 
@@ -35,10 +39,10 @@ function handleRetry(txHash: string, error: any) {
   const norm = normaliseHash(txHash);
   const attempts = (retryCounts.get(norm) ?? 0) + 1;
   retryCounts.set(norm, attempts);
-  if (attempts > MAX_RETRY_BUDGET) {
+  if (attempts > RETRY_BUDGET) {
     try {
-      fs.mkdirSync(DEFAULT_QUARANTINE_PATH, { recursive: true });
-      const filePath = path.join(DEFAULT_QUARANTINE_PATH, `${norm}.json`);
+      fs.mkdirSync(QUARANTINE_PATH, { recursive: true });
+      const filePath = path.join(QUARANTINE_PATH, `${norm}.json`);
       fs.writeFileSync(
         filePath,
         JSON.stringify({ txHash: norm, error: error?.message ?? String(error) }, null, 2),
@@ -46,9 +50,9 @@ function handleRetry(txHash: string, error: any) {
     } catch (e) {
       console.error("[reprocess] Failed to write quarantine file", e);
     }
-    return { status: "quarantined" as const, error: error?.message ?? String(error) };
+    return { status: "quarantined" as const, attempts, error: error?.message ?? String(error) };
   }
-  return { status: "error" as const, error: error?.message ?? String(error) };
+  return { status: "error" as const, attempts, error: error?.message ?? String(error) };
 }
 
 /** Zod schema for the status‑changes query parameters. */
@@ -89,6 +93,7 @@ reprocessEventsRouter.post(
         notFoundResponse(res, "Transaction not found");
         return;
       }
+      // Preserve original success shape but expose attempts if present
       res.json({ message: "Events reprocessed", result });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
@@ -97,10 +102,16 @@ reprocessEventsRouter.post(
       }
       const retry = handleRetry(req.params.tx_hash, e);
       if (retry.status === "quarantined") {
-        res.json({ message: "Transaction quarantined after repeated failures", error: retry.error });
+        res.json({
+          message: "Transaction quarantined after repeated failures",
+          attempts: retry.attempts,
+          error: retry.error,
+        });
         return;
       }
-      next(e);
+      // For non‑quarantined errors, include attempt count for backward compatibility info
+      res.status(500).json({ attempts: retry.attempts, error: retry.error });
+      return;
     }
   },
 );
@@ -142,10 +153,14 @@ reprocessEventsRouter.post(
         } catch (e: any) {
           const retry = handleRetry(txHash, e);
           if (retry.status === "quarantined") {
-            result = { txHash, status: "quarantined", error: retry.error };
+            result = { txHash, status: "quarantined", attempts: retry.attempts, error: retry.error };
           } else {
-            result = { txHash, status: "error", eventsProcessed: 0, eventLabels: [], error: retry.error };
+            result = { txHash, status: "error", attempts: retry.attempts, eventsProcessed: 0, eventLabels: [], error: retry.error };
           }
+          
+          resultByNormalizedHash.set(normalizedHash, result);
+          results.push(result);
+          continue;
         }
         resultByNormalizedHash.set(normalizedHash, result);
         results.push(result);
