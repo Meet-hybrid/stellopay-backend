@@ -32,6 +32,7 @@ export default defineConfig({
         "src/utils/validation.ts",
         "src/shutdown.ts",
         "scripts/check-env-sync.ts",
+        "scripts/lint-migrations.ts",
       ],
       thresholds: {
         lines: 95,
