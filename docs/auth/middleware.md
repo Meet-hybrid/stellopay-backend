@@ -213,6 +213,8 @@ breaking, and needs a coordinated change in `routes/auth.ts`,
   throwing session lookup).
 - `requireAuth` success path (lowercased address stored, raw token
   stored, next called).
+- `requireAuth` idempotency paths (second call skips re-validation,
+  original principal preserved when headers change between calls).
 - `requireAdmin` 401 path (missing `req.auth`, empty address).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).

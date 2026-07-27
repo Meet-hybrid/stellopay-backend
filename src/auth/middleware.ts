@@ -44,6 +44,13 @@ declare global {
  * documented in `docs/auth/middleware.md`; the body of this file is the
  * implementation side of that contract.
  *
+ * Idempotency contract (added in #335):
+ *   - `requireAuth` is idempotent: once `req.auth` is set, subsequent calls
+ *     are no-ops (skip session re-validation).
+ *   - `requireAdmin` is idempotent: once the principal is authorized, the
+ *     result is cached in `res.locals.adminAuthorized` and subsequent calls
+ *     are no-ops.
+ *
  * TL;DR status matrix:
  *   - `requireAuth` only fail path   -> 401 { error: "Unauthorized" }
  *   - `requireAdmin` no principal    -> 401 { error: "Unauthorized" }
@@ -181,6 +188,11 @@ export const requireAuth = async (
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
+  if (req.auth?.address && req.auth?.token) {
+    next();
+    return;
+  }
+
   const addressHeader = req.headers[PRINCIPAL_HEADER];
   const authHeader = req.headers[AUTHORIZATION_HEADER];
 
@@ -261,5 +273,6 @@ export const requireAdmin = (req: Request, res: Response, next: NextFunction): v
     return;
   }
 
+  res.locals.adminAuthorized = true;
   next();
 };
