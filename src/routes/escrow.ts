@@ -7,7 +7,16 @@ import { requireSession } from "../auth/session.js";
 import { db, schema } from "../db/index.js";
 import { eq, and } from "drizzle-orm";
 
-const AddressParam = z.string().min(3);
+import { normalizeStarknetAddress } from "../utils/address.js";
+
+const AddressParam = z.string().min(3).transform((val, ctx) => {
+  try {
+    return normalizeStarknetAddress(val);
+  } catch (e: any) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: e.message });
+    return z.NEVER;
+  }
+});
 const AgreementIdParam = z.coerce.bigint().positive();
 
 const WalletSession = z.object({
