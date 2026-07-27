@@ -11,9 +11,34 @@ Each query is a DB-side `EXTRACT(MONTH FROM ...)` grouping, filtered to the call
 
 ---
 
+## Input Validation & Input Hardening
+
+- **`user_address` (path param)**:
+  - Validated via `StarknetAddress` Zod schema (hex string up to 64 chars, optional `0x` prefix).
+  - Transformed into canonical normalized hex address before database querying.
+  - Invalid formats throw a `ZodError` mapped to HTTP 400 before database execution.
+- **`year` (query param)**:
+  - Validated via `AnalyticsQuerySchema`.
+  - Must be an integer within the range `2020` to `2100`.
+  - Empty values (`""`, `null`, `undefined`) fall back gracefully to the current year (`new Date().getFullYear()`).
+  - Malformed strings, non-integers (e.g. `2026.5`), or out-of-range years (`1999`, `3000`) throw a `ZodError` mapped to HTTP 400.
+
+---
+
+## Data Aggregation Robustness
+
+- **Safe Amount Parsing (`parseBigIntSafe`)**:
+  - Raw amount values from database rows (`payments`, `escrowEvents`) are safely parsed using `parseBigIntSafe`.
+  - Missing, `null`, `undefined`, or unparseable string values fall back to `0n` instead of throwing unhandled `TypeError` or `SyntaxError` exceptions.
+- **Month Bounds Check (`isValidMonth`)**:
+  - Extracted month values are checked via `isValidMonth(month)` to ensure they are integers between `1` and `12`.
+  - Any corrupted or out-of-bound month values are safely skipped without corrupting chart data or array indexing.
+
+---
+
 ## Telemetry & Metrics
 
-Every invocation of the rollup endpoint is instrumented. Telemetry fires **after all three DB queries complete** (success path) or **inside the catch block** (error path), and respects the global `LOG_FORMAT` and `LOG_LEVEL` settings.
+Every invocation of the rollup endpoint is instrumented. Telemetry fires **after all three DB queries complete** (success path) or **inside the catch block for non-Zod errors** (error path), and respects global `LOG_FORMAT` and `LOG_LEVEL` settings. Zod 400 validation failures do not emit DB error telemetry.
 
 ### Log format — JSON (`LOG_FORMAT=json`)
 
@@ -75,11 +100,12 @@ Every invocation of the rollup endpoint is instrumented. Telemetry fires **after
 
 ---
 
-## Security Notes
+## Security & Reliability Notes
 
 - `duration_ms` is total DB round-trip time for all three queries, useful as a latency gauge against slow queries or pool exhaustion.
 - `row_counts` is a diagnostic metric; it does not leak per-row data or PII.
 - `user_address` in logs is the **normalized** form; no raw user input appears in logs.
+- Unparseable amounts or malformed DB rows default to zero rather than crashing the endpoint with a 500 error.
 
 ---
 
