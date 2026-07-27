@@ -15,18 +15,34 @@ import path from "path";
 
 export const reprocessEventsRouter = Router();
 
-/** Maximum number of events to reprocess in a single status‑changes request. */
+/** Maximum number of events to reprocess in a single status‑changes request.
+ * This limit caps the number of rows returned by the `/reprocess-events/status-changes`
+ * endpoint to protect against excessively large responses.
+ */
 export const MAX_STATUS_LIMIT = 1000;
 
-/** Default retry budget for reprocessing failures. Can be overridden via the `RETRY_BUDGET` environment variable. */
+/** Default retry budget for reprocessing failures.
+ * The number of allowed attempts before a transaction is moved to quarantine.
+ * Can be overridden via the `RETRY_BUDGET` environment variable.
+ */
 export const RETRY_BUDGET = Number(process.env.RETRY_BUDGET) || 3;
 
-/** Directory where quarantined transaction hashes are persisted. Can be overridden via the `QUARANTINE_PATH` environment variable. */
+/** Directory where quarantined transaction hashes are persisted.
+ * The path can be overridden with the `QUARANTINE_PATH` environment variable.
+ * When not set, a `quarantine` folder is created in the current working directory.
+ */
 export const QUARANTINE_PATH = process.env.QUARANTINE_PATH
   ? path.resolve(process.env.QUARANTINE_PATH)
   : path.resolve(process.cwd(), "quarantine");
 /** In‑memory map tracking retry attempts per normalized transaction hash. */
 const retryCounts = new Map<string, number>();
+
+/**
+ * Reset in‑memory retry counts. Exported for tests to ensure isolation.
+ */
+export function __resetRetryCounts() {
+  retryCounts.clear();
+}
 
 /** Normalise a transaction hash to the canonical 0x + 64‑hex form. */
 function normaliseHash(hash: string): string {
